@@ -85,14 +85,15 @@ def _same_hour_heuristic(
     hour_idx: int,
     config: LatentDemandConfig,
 ) -> tuple[float | None, str]:
+    # Backward-only window: a stockout on day_idx must never be reconstructed using
+    # days after it, or the "ground truth" target a forecaster is trained on would
+    # already encode information that isn't available at prediction time.
     window_start = max(0, day_idx - config.same_hour_window_days)
-    window_end = min(len(sales), day_idx + config.same_hour_window_days + 1)
-    same_hour_values: list[float] = []
-    for offset in range(window_start, window_end):
-        if offset == day_idx:
-            continue
-        if status[offset, hour_idx] == 0:
-            same_hour_values.append(float(sales[offset, hour_idx]))
+    same_hour_values = [
+        float(sales[offset, hour_idx])
+        for offset in range(window_start, day_idx)
+        if status[offset, hour_idx] == 0
+    ]
     if len(same_hour_values) >= config.min_same_hour_points:
         return float(np.mean(same_hour_values)), "heuristic_same_hour"
 
@@ -100,18 +101,24 @@ def _same_hour_heuristic(
     if len(in_stock_today) > 0:
         return float(np.mean(in_stock_today)), "fallback_day_mean"
 
-    global_in_stock = sales[status == 0]
-    if len(global_in_stock) > 0:
-        return float(np.mean(global_in_stock)), "fallback_global_mean"
+    backward_in_stock = sales[:day_idx][status[:day_idx] == 0]
+    if len(backward_in_stock) > 0:
+        return float(np.mean(backward_in_stock)), "fallback_global_mean"
     return 0.0, "fallback_zero"
 
 
 def _build_reconstruction_training_frame(
     prepared_df: pd.DataFrame,
     config: LatentDemandConfig,
+    cutoff: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
+    # `cutoff` excludes rows on/after it from the imputation model's own training data,
+    # so stockouts in the train/val period are never reconstructed using a model that
+    # has implicitly learned patterns from the future (e.g. test-period) rows it will
+    # later be asked to impute.
     records: list[dict[str, Any]] = []
-    for _, row in prepared_df.sort_values(["product_id", "store_id", "dt"]).iterrows():
+    frame = prepared_df if cutoff is None else prepared_df[prepared_df["dt"] < cutoff]
+    for _, row in frame.sort_values(["product_id", "store_id", "dt"]).iterrows():
         sales = row["hours_sale"]
         status = row["hours_stock_status"]
         for hour in range(config.sequence_length):
@@ -164,9 +171,10 @@ def backtest_reconstruction(
     prepared_df: pd.DataFrame,
     config: LatentDemandConfig | None = None,
     max_samples: int = 256,
+    reconstruction_cutoff: pd.Timestamp | None = None,
 ) -> ReconstructionDiagnostics:
     config = config or LatentDemandConfig()
-    train_frame = _build_reconstruction_training_frame(prepared_df, config)
+    train_frame = _build_reconstruction_training_frame(prepared_df, config, cutoff=reconstruction_cutoff)
     if train_frame.empty:
         return ReconstructionDiagnostics(
             model_used=False,
@@ -204,10 +212,11 @@ def backtest_reconstruction(
 def reconstruct_latent_demand(
     df: pd.DataFrame,
     config: LatentDemandConfig | None = None,
+    reconstruction_cutoff: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, ReconstructionDiagnostics]:
     config = config or LatentDemandConfig()
     prepared = prepare_daily_dataframe(df, config=config)
-    train_frame = _build_reconstruction_training_frame(prepared, config)
+    train_frame = _build_reconstruction_training_frame(prepared, config, cutoff=reconstruction_cutoff)
 
     model = None
     if len(train_frame) >= config.model_min_training_rows:
@@ -271,7 +280,7 @@ def reconstruct_latent_demand(
         out["latent_demand"] = list(latent)
         reconstructed_groups.append(out)
 
-    diagnostics = backtest_reconstruction(prepared, config=config)
+    diagnostics = backtest_reconstruction(prepared, config=config, reconstruction_cutoff=reconstruction_cutoff)
     diagnostics.model_used = model is not None
     diagnostics.total_stockout_hours = total_stockout_hours
     diagnostics.heuristic_imputed_hours = heuristic_imputed_hours

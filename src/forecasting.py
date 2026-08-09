@@ -190,7 +190,13 @@ def export_rl_forecast_features(
 
 
 class NeuralForecastAdapter:
-    """Thin optional adapter so notebooks can still train NeuralForecast models."""
+    """Thin optional adapter so notebooks can still train NeuralForecast models.
+
+    NOTE: for static covariates (`bundle.static_cols`) to actually influence
+    predictions, the wrapped `model` must itself be constructed with
+    `stat_exog_list=list(bundle.static_cols)` — passing `static_df` into `fit()`
+    only supplies the values, the model still has to be told to use them.
+    """
 
     def __init__(self, model, name: str):
         self.model = model
@@ -201,13 +207,52 @@ class NeuralForecastAdapter:
         from neuralforecast import NeuralForecast
 
         self._nf = NeuralForecast(models=[self.model], freq="h")
-        self._nf.fit(df=train_df[["unique_id", "ds", bundle.target_col] + bundle.future_cols + bundle.historic_cols], val_size=len(val_df))
+        cols = ["unique_id", "ds", bundle.target_col] + bundle.future_cols + bundle.historic_cols
+        # NeuralForecast looks for a column literally named "y" unless told otherwise;
+        # bundle.target_col is "y_model" whenever a log1p transform is applied, so it
+        # must be renamed here or fit() raises KeyError('y').
+        nf_train = train_df[cols].rename(columns={bundle.target_col: "y"})
+        self._nf.fit(df=nf_train, static_df=bundle.static_df, val_size=len(val_df))
 
     def predict(self, history_df: pd.DataFrame, future_df: pd.DataFrame, bundle: ForecastDatasetBundle) -> pd.DataFrame:
         if self._nf is None:
             raise RuntimeError("Adapter must be fit before predict")
-        futr_df = future_df[["unique_id", "ds"] + bundle.future_cols].copy()
-        preds = self._nf.predict(futr_df=futr_df).reset_index()
-        model_cols = [c for c in preds.columns if c not in {"unique_id", "ds"}]
+
+        # A single nf.predict() call only forecasts the h steps immediately after the
+        # data it was fit/re-based on — it does NOT know how to reach an arbitrary,
+        # possibly far-future `future_df` window on its own. Walk forward, feeding
+        # back the true observed values (already present in future_df) as new history
+        # at each step, so the full requested span gets covered with dates that
+        # actually line up with future_df. Each window's expected (unique_id, ds)
+        # combinations come from `make_future_dataframe(df=...)` rather than a
+        # global date union, because per-series history can end at slightly
+        # different timestamps (e.g. differing NaN-drop counts from lag features).
+        cols = ["unique_id", "ds", bundle.target_col] + bundle.future_cols + bundle.historic_cols
+        rolling_history = history_df[cols].rename(columns={bundle.target_col: "y"})
+        future_exog = future_df[["unique_id", "ds"] + bundle.future_cols]
+        future_actuals = future_df[cols].rename(columns={bundle.target_col: "y"})
+        max_ds = future_df["ds"].max()
+
+        forecasts: list[pd.DataFrame] = []
+        max_iterations = 500
+        for _ in range(max_iterations):
+            if rolling_history["ds"].max() >= max_ds:
+                break
+            expected = self._nf.make_future_dataframe(df=rolling_history)
+            futr_input = expected.merge(future_exog, on=["unique_id", "ds"], how="left")
+            futr_input[bundle.future_cols] = futr_input[bundle.future_cols].fillna(0.0)
+
+            preds = self._nf.predict(df=rolling_history, static_df=bundle.static_df, futr_df=futr_input).reset_index()
+            forecasts.append(preds)
+
+            next_actuals = future_actuals.merge(expected[["unique_id", "ds"]], on=["unique_id", "ds"], how="inner")
+            if next_actuals.empty:
+                break
+            rolling_history = pd.concat([rolling_history, next_actuals], ignore_index=True)
+
+        if not forecasts:
+            return pd.DataFrame(columns=["unique_id", "ds", "prediction"])
+        all_preds = pd.concat(forecasts, ignore_index=True)
+        model_cols = [c for c in all_preds.columns if c not in {"unique_id", "ds"}]
         pred_col = model_cols[0]
-        return preds[["unique_id", "ds", pred_col]].rename(columns={pred_col: "prediction"})
+        return all_preds[["unique_id", "ds", pred_col]].rename(columns={pred_col: "prediction"})

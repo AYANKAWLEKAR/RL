@@ -43,6 +43,57 @@ def test_reconstruct_latent_demand_imputes_short_and_long_stockouts(synthetic_da
     assert diagnostics.model_imputed_hours >= 1
 
 
+def test_reconstruction_does_not_leak_future_days_into_past_stockouts():
+    def make_df(future_sales_value: float) -> pd.DataFrame:
+        rows = []
+        start = pd.Timestamp("2024-01-01")
+        for day_idx in range(30):
+            hours = np.arange(24)
+            base = 4 + 1.5 * np.sin((hours - 6) / 24 * 2 * np.pi)
+            sales = np.clip(base, 0.2, None).round(3)
+            stock = np.zeros(24, dtype=int)
+            if day_idx == 5:
+                stock[10:12] = 1
+                sales[10:12] = 0
+            if day_idx == 10:
+                sales[:] = future_sales_value
+            rows.append(
+                {
+                    "city_id": 1,
+                    "store_id": 1,
+                    "management_group_id": 1,
+                    "first_category_id": 10,
+                    "second_category_id": 100,
+                    "third_category_id": 1000,
+                    "product_id": 101,
+                    "dt": start + pd.Timedelta(days=day_idx),
+                    "sale_amount": float(sales.sum()),
+                    "hours_sale": sales.tolist(),
+                    "hours_stock_status": stock.tolist(),
+                    "discount": 0.0,
+                    "holiday_flag": 0,
+                    "activity_flag": 0,
+                    "precpt": 0.0,
+                    "avg_temperature": 60.0,
+                    "avg_humidity": 40.0,
+                    "avg_wind_level": 5.0,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    config = LatentDemandConfig(model_min_training_rows=10_000)  # isolate the heuristic path
+    recon_low, _ = reconstruct_latent_demand(make_df(1.0), config)
+    recon_high, _ = reconstruct_latent_demand(make_df(50.0), config)
+
+    def imputed_hours(reconstructed: pd.DataFrame) -> np.ndarray:
+        row = reconstructed[reconstructed["dt"] == pd.Timestamp("2024-01-06")].iloc[0]
+        return np.asarray(row["latent_demand"])[10:12]
+
+    # Day 10 is chronologically AFTER the day-5 stockout, so changing only day 10's
+    # sales must not change how the day-5 stockout gets reconstructed.
+    assert np.allclose(imputed_hours(recon_low), imputed_hours(recon_high))
+
+
 def test_backtest_reconstruction_reports_metrics(synthetic_daily_df: pd.DataFrame):
     diagnostics = backtest_reconstruction(synthetic_daily_df, LatentDemandConfig(model_min_training_rows=64))
     assert diagnostics.masked_backtest_rows > 0
