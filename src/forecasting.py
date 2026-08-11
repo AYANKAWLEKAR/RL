@@ -86,6 +86,27 @@ class PersistenceForecaster:
         return preds
 
 
+class ZeroForecaster:
+    """Predicts zero everywhere. The control for intermittent demand.
+
+    On sparse series (FreshRetailNet is ~78% zero hours, mean 0.042 units/hour)
+    MAE is minimized by the conditional median, which is zero. A model can post an
+    impressive-looking MAE while having learned nothing. Always report this
+    alongside real models: if a model cannot beat predicting zero, its MAE is
+    measuring the sparsity of the data, not the skill of the model.
+    """
+
+    name = "Zero"
+
+    def fit(self, train_df: pd.DataFrame, val_df: pd.DataFrame, bundle: ForecastDatasetBundle) -> None:
+        return None
+
+    def predict(self, history_df: pd.DataFrame, future_df: pd.DataFrame, bundle: ForecastDatasetBundle) -> pd.DataFrame:
+        preds = future_df[["unique_id", "ds"]].copy()
+        preds["prediction"] = 0.0
+        return preds
+
+
 def prepare_forecast_frames(
     hourly_df: pd.DataFrame,
     config: ForecastConfig | None = None,
@@ -254,5 +275,13 @@ class NeuralForecastAdapter:
             return pd.DataFrame(columns=["unique_id", "ds", "prediction"])
         all_preds = pd.concat(forecasts, ignore_index=True)
         model_cols = [c for c in all_preds.columns if c not in {"unique_id", "ds"}]
-        pred_col = model_cols[0]
+        if not model_cols:
+            raise RuntimeError("NeuralForecast returned no prediction columns")
+        # Under a point loss (MAE) there is exactly one output column. Under a
+        # quantile loss (MQLoss) there are several — "<Model>-median", "<Model>-lo-90",
+        # "<Model>-hi-90" ... — and column order is NOT guaranteed to put the median
+        # first, so taking model_cols[0] can silently score a tail quantile as if it
+        # were the point forecast. Prefer an explicit median column when present.
+        median_cols = [c for c in model_cols if "median" in c.lower()]
+        pred_col = median_cols[0] if median_cols else model_cols[0]
         return all_preds[["unique_id", "ds", pred_col]].rename(columns={pred_col: "prediction"})
