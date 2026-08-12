@@ -2,7 +2,9 @@
 
 StockSmart is an intelligent inventory management system that combines **transformer-based demand forecasting** with **deep reinforcement learning** to optimize replenishment decisions. The system learns optimal ordering policies by processing historical sales data, stockout events, and exogenous factors, dynamically balancing holding costs against stockout penalties.
 
-The primary approach trains **per-category DQN agents** — one shared Deep Q-Network per product category that learns a generalized ordering policy across all products in that category. An optional **Genetic Algorithm (GA) pretraining** step can seed the DQN replay buffer with evolved (s, S) policy trajectories for faster convergence.
+The validated approach trains a **single-product DQN** for restocking, benchmarked against `(s,S)`, EOQ and never-order baselines. A **per-category** agent (`CategoryInventoryEnv`) shares one policy across all products in a category; the environment is implemented and tested but the category agent has not yet been trained.
+
+> **Status.** Forecasting and single-product RL are validated end-to-end on real FreshRetailNet data. See `design.md` for results and the defects fixed along the way, and `execution.md` for the runbook. A Genetic-Algorithm replay-seeding path exists in the notebook but has never been exercised — treat it as unvalidated.
 
 ## Architecture
 
@@ -24,7 +26,7 @@ FreshRetailNet-50K Dataset
          ▼
 ┌─────────────────────┐
 │  RL Optimization     │  Per-category DQN agents (Stable-Baselines3)
-│  (rl_optimization)   │  Optional GA pretraining (DEAP) / Gymnasium
+│  (rl_optimization)   │  Single-product + per-category envs / Gymnasium
 └─────────────────────┘
 ```
 
@@ -48,7 +50,7 @@ Key fields: `hours_sale`, `hours_stock_status`, `discount`, `holiday_flag`, `act
 | Environment API | Gymnasium |
 | Deep Learning | PyTorch |
 | Transformer Models | PyTorch Lightning / Hugging Face Transformers |
-| Genetic Algorithm | DEAP (optional) |
+| Genetic Algorithm | DEAP (optional, unvalidated) |
 | Data Processing | Pandas, NumPy |
 | Forecasting | NeuralForecast (LSTM, TFT) |
 | MILP Baseline | Pyomo + GLPK |
@@ -103,7 +105,8 @@ jupyter notebook
 
 - **LSTM baseline**: 168-hour lookback, multi-step 24-hour forecast
 - **Temporal Fusion Transformer (TFT)**: probabilistic quantile forecasts with attention-based interpretability
-- Evaluate on MAE, RMSE, Quantile Loss, and bias metrics
+- Evaluate on MAE, RMSE and bias **against a zero baseline and lag-24 persistence**.
+  On intermittent demand MAE is minimized by predicting zero, so a raw MAE figure is not evidence of skill — `rel_zero < 1.0` is the real gate
 - Export point forecasts + prediction intervals as RL state features
 
 ### 3. RL Optimization (`rl_optimization.ipynb`)
@@ -118,17 +121,19 @@ Per-category DQN training loop:
 1. Select the top 5 product categories by number of product-store combinations
 2. For each category, build a `CategoryInventoryEnv` with all its product-stores
 3. Train a DQN agent (MlpPolicy, [256, 256], epsilon-greedy) on the category environment
-4. Optionally seed the replay buffer with GA-evolved (s, S) policy trajectories (`USE_GA_PRETRAINING = True`)
+4. Optionally seed the replay buffer with GA-evolved (s, S) trajectories (`USE_GA_PRETRAINING = True`, unvalidated)
 5. Evaluate against (s, S), EOQ, and random baselines on the test split
 6. Visualize inventory trajectories and cumulative cost per category
 
 State vector for `CategoryInventoryEnv`:
 ```
 [product_index_normalized, on_hand_inventory, incoming_shipments...,
- demand_forecast..., price, discount, stockout_history...]
+ demand_forecast..., stockout_history...]
 ```
 
-Reward: negative total cost = -(holding + stockout penalty + ordering costs)
+Reward: `-(holding + stockout penalty + ordering costs) * reward_scale`. Scaling keeps Q-values learnable (raw episode cost reaches ~1e4); `total_cost` stays in raw units for reporting.
+
+Actions are **order-up-to levels**, not raw quantities: action *a* targets an inventory position of `a * order_level_step` and the environment orders the shortfall. This scales with demand — a fixed 0-50 quantity cap could not cover 26% of real series at `lead_time=2`.
 
 ## Configuration
 
@@ -136,10 +141,10 @@ Key flags in `rl_optimization.ipynb`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `USE_GA_PRETRAINING` | `False` | Enable GA (s,S) evolution + replay seeding |
+| `USE_GA_PRETRAINING` | `False` | Enable GA (s,S) evolution + replay seeding (unvalidated) |
 | `TOTAL_TIMESTEPS` | `20,000` | DQN training steps per category |
 | `N_CATEGORIES` | `5` | Number of product categories to train |
-| `EPISODE_LENGTH` | `365` | Days per episode |
+| `EPISODE_LENGTH` | `10` | Days per episode. MUST be shorter than the split (test is ~15 days) or `random_start` has no slack and every episode is identical |
 
 ## Evaluation & Experiment Tracking
 

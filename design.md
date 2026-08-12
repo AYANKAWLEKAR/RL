@@ -311,3 +311,63 @@ wrong conclusion in opposite directions.
   handles it, but a genuinely converged agent would not need rescuing.
 - **The imputation caveat from Part 5 still applies** — a third of the demand the
   agent optimizes against is GBM-generated.
+
+---
+
+## Part 8 — Training instability: investigated, and mostly *not* fixable
+
+The val curve improves to ~15-25k steps then degrades (185 → 271 by 60k). Investigated
+with instrumentation rather than hyperparameter guessing, because two candidate causes
+need opposite remedies.
+
+### The decisive measurement
+
+Evaluating on **train and val at every checkpoint** separates them:
+
+| | best (25k) | final (60k) | Δ |
+|---|---|---|---|
+| train cost | 188.5 | 200.6 | **+12.1** |
+| val cost | 186.1 | 271.3 | **+85.1** |
+
+Train barely moves while val degrades 7× more → **overfitting**, not optimization
+blowup. Corroborated by `|Q|` growing only 2.3× (2.67 → 6.14, bounded) and TD loss
+staying in range; a diverging Q-function would show neither.
+
+### A real bug found on the way — that did NOT fix it
+
+Every checkpoint reported `eps=0.010`, including the first at 5k steps. Cause: the
+training loop called `agent.learn(chunk, reset_num_timesteps=False)` repeatedly, and
+SB3 recomputes `_total_timesteps` per call, so the ε-schedule collapses to its floor
+inside the first chunk. **The agent explored for ~2k of 60k steps.**
+
+Hypothesis: restoring the schedule would cure the degradation. A/B, same seed and
+budget, single variable:
+
+| Variant | ε range | best val | final val | degradation |
+|---|---|---|---|---|
+| CHUNKED (was) | 0.010 … 0.010 | 182.4 @25k | 270.5 | +88.1 |
+| SINGLE (fixed) | 0.010 … 0.794 | 179.4 @45k | 266.2 | **+86.9** |
+
+The schedule is demonstrably repaired, and the degradation is **unchanged**. The
+hypothesis was wrong. Recorded because a plausible-sounding fix that changes nothing is
+worth knowing about — it would otherwise get "fixed" again by the next person.
+
+The ε bug is still fixed, on correctness grounds: an agent that stops exploring after
+3% of its budget is not doing what the config says.
+
+### What actually causes it
+
+**Not enough training data.** 61 train days at `episode_length=10` is ~51 distinct
+windows; a 60k-step budget is ~6,000 episodes, so each window is replayed ~118 times.
+Both A/B variants overfit identically because both see the same tiny window set.
+
+This is a data-quantity limit, not a bug, and it has no hyperparameter fix. The
+remedies are:
+
+1. **Best-on-val checkpointing** — already in place. For overfitting this is the
+   *correct* answer, not a workaround.
+2. **More data** — train across many products rather than one product's 61 days.
+   That is exactly what `CategoryInventoryEnv` is for, and is the strongest reason to
+   build the category agent beyond the product claim itself.
+3. **Smaller budget.** 60k steps over 51 windows is far past the point of return;
+   the seed study uses 30k.

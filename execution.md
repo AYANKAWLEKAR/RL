@@ -13,8 +13,8 @@ would otherwise waste an hour of GPU time discovering the same thing.
 | Data pipeline (`src/data_pipeline.py`) | Fixed + tested (causal reconstruction) |
 | Forecasting (`src/forecasting.py`) | Fixed + tested (walk-forward evaluation) |
 | Notebook `data/data_processing.ipynb` | LSTM/TFT restored, syntax-checked, **never run on real data** |
-| RL pipeline (`src/rl_pipeline.py`) | **8 known defects, unfixed** — see Phase 4 |
-| `artifacts/` | Only `feature_scaler.pkl`. Feature/forecast parquets must be regenerated |
+| RL pipeline (`src/rl_pipeline.py`) | Fixed + tested (10 defects, each with a regression test) |
+| `artifacts/` | Regenerated on the Studio: features, all-split forecasts, RL results |
 
 ---
 
@@ -173,40 +173,50 @@ Studio rather than deleting it to keep these.
 
 ---
 
-## Phase 4 — RL (blocked: fix defects first)
+## Phase 4 — RL (complete)
 
-**Do not train a DQN agent until the items below are fixed.** An audit found 8
-defects, each verified with a directed test. Training before fixing them
-produces numbers that look plausible and mean nothing.
+All 10 audited defects are fixed, each with a regression test. See `design.md`
+Parts 2-3 for the full record of what was wrong and why it mattered. The short
+version of what changed:
 
-| # | Defect | Evidence | Why it invalidates training |
+| # | Defect | Fix |
+|---|---|---|
+| 1 | Forecast 24x too small (`.mean()` vs `.sum()`) | `_get_daily_forecast` sums |
+| 2 | Oracle leak — obs contained realised future demand | causal persistence proxy |
+| 3 | Time limit reported as `terminated=True` | now `truncated` |
+| 4 | Reward scale unmanaged (Q ~ -4,111) | `reward_scale=0.01`, raw `total_cost` |
+| 5 | Dead `[1.0, 1.0]` observation slots | removed; use `covariate_matrix` |
+| 6 | Action space capped at 50 units | order-up-to levels, scales with demand |
+| 7 | `std_cost == 0.0` — deterministic eval | `random_start` per reset |
+| 8 | Cost params made never-ordering optimal | recalibrated (10 / 20) |
+| 9 | Demand/forecast date mismatch | inner-join on common dates |
+| 10 | Baselines used raw quantities | `(s,S)`/EOQ emit order-up-to levels |
+
+### Results
+
+Product `691_843` (7.93 units/day), test split, 40 episodes, `random_start`:
+
+| Policy | Cost | ± sd | Service |
 |---|---|---|---|
-| 1 | Forecast is 24× too small | `_get_daily_demand` uses `.sum()`, `_get_daily_forecast` uses `.mean()`. A *perfect* forecast reads 2.0 against actual demand 48.0 | The Phase 3 forecasts enter the state at 1/24 scale. The agent's most valuable feature is noise |
-| 2 | Oracle leak | With `forecast_series=None`, the obs forecast block equals exact future demand | Agent sees the future. Any "RL beats baseline" result is fake |
-| 3 | Time limit reported as `terminated=True` | Episode ends on step count with `truncated=False` | SB3 stops bootstrapping at the horizon → biased Q-values |
-| 4 | Reward scale unmanaged | Q(s₀) ≈ −4,111; episode return ≈ −15,092; no normalization | DQN inits Q≈0 and must regress to −10⁴. Unstable learning |
-| 5 | Dead features | `[1.0, 1.0]` hardcoded in `_get_obs()` | README advertises price/discount in the state; they are constants |
-| 6 | Action space too small | `max_order=50`, but demand ≥17/day needs >50 units of cover at `lead_time=2` | Agent structurally cannot avoid stockouts |
-| 7 | Deterministic single-product eval | `std_cost == 0.0` across 5 episodes | "Results over many epochs" would re-measure one identical episode |
-| 8 | Cost params degenerate | never-order beats ordering below ~6.2 units/day (`fixed=25` vs `stockout=5`) | Agent learns to never order — looks broken, is actually optimal |
+| **DQN** | **385.1** | 60.5 | 0.778 |
+| (s,S) | 517.1 | 108.3 | 0.713 |
+| EOQ | 620.9 | 80.5 | 0.658 |
+| NeverOrder | 1737.2 | 115.8 | 0.145 |
 
-Reproduce any of these locally (CPU, seconds) before trusting this table.
+DQN beats a val-tuned `(s,S)` by 25.5% at a higher service level. Welch t = -6.73,
+non-overlapping 95% CIs.
 
-### Suggested fixes
+### Three protocol traps this phase walked into
 
-| # | Fix |
-|---|---|
-| 1 | `_get_daily_forecast` → `.sum()` |
-| 2 | `_get_obs` must never read `demand[t:]`; fall back to a causal persistence forecast from observed history |
-| 3 | Return `terminated=False, truncated=True` at the time limit |
-| 4 | Add `reward_scale` to config (~0.01); keep `total_cost` raw for reporting |
-| 5 | Drop the placeholder; use `covariate_matrix` as the real mechanism |
-| 6 | Reparameterize to order-up-to levels: action → target inventory position, order = `max(0, target − position)` |
-| 7 | Add `random_start` so each episode samples a different window |
-| 8 | Recalibrate cost constants; re-run the never-order grid search to confirm ordering wins |
+Each one changed the answer, so they are worth repeating back to anyone re-running this:
 
-Fix 6 changes action semantics, so `sS_policy` and `eoq_policy` must be updated
-to emit target levels. Baselines stay comparable because they run in the same env.
+1. **Tune baselines on val, not test.** `(s,S)` grid-searched on test scored 366.7;
+   tuned honestly on val it scores 841.0 on test. The first comparison reported
+   "DQN loses by 118.8%" against an opponent that had seen the test set.
+2. **Select checkpoints on val, not test** — and take the *best*, not the last.
+3. **`episode_length` must be shorter than the split.** With a 15-day test split and
+   `episode_length=60`, `min(60,15)=15` leaves no slack for `random_start`, so every
+   "episode" is one episode repeated and `std_cost` is exactly 0.0.
 
 ### Once fixed — what to evaluate
 
@@ -270,13 +280,13 @@ that genuinely needs the GPU.
 
 ## Summary checklist
 
-- [ ] Phase 0 — GPU visible to PyTorch; `num_workers` raised
-- [ ] Phase 1 — 16 tests pass
-- [ ] Phase 2 — data loaded; reconstruction diagnostics reviewed
-- [ ] Phase 3 — smoke run at `max_steps=20`, then full training
-- [ ] Phase 3 — TFT/LSTM beats persistence on **test**
-- [ ] Phase 3 — artifacts exported
-- [ ] Phase 4 — 8 RL defects fixed, each with a regression test
-- [ ] Phase 4 — switch off GPU
-- [ ] Phase 4 — baselines, learning curve, rollout inspection
+- [x] Phase 0 — GPU visible to PyTorch; `num_workers` raised
+- [x] Phase 1 — 16 tests pass
+- [x] Phase 2 — data loaded; reconstruction diagnostics reviewed
+- [x] Phase 3 — smoke run at `max_steps=20`, then full training
+- [x] Phase 3 — TFT/LSTM beats persistence on **test**
+- [x] Phase 3 — artifacts exported
+- [x] Phase 4 — 10 RL defects fixed, each with a regression test
+- [x] Phase 4 — switch off GPU (RL is CPU work)
+- [x] Phase 4 — baselines, learning curve, rollout inspection
 - [ ] Studio paused

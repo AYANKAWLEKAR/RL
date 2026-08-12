@@ -26,6 +26,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from stable_baselines3.common.callbacks import BaseCallback  # noqa: E402
+
 from src.rl_pipeline import (  # noqa: E402
     DQNConfig,
     InventoryEnvConfig,
@@ -135,19 +137,39 @@ def main():
         return int(a)
 
     curve = []
-    done_steps = 0
-    best_val, best_path = None, "artifacts/dqn_best"
-    while done_steps < args.timesteps:
-        chunk = min(args.eval_every, args.timesteps - done_steps)
-        agent.learn(total_timesteps=chunk, reset_num_timesteps=False, progress_bar=False)
-        done_steps += chunk
-        m = evaluate_policy(val_env, dqn_policy, n_episodes=args.eval_episodes)
-        curve.append(dict(steps=done_steps, **m))
-        star = ""
-        if best_val is None or m["avg_cost"] < best_val:
-            best_val = m["avg_cost"]; agent.save(best_path); star = "  <- best so far"
-        log("  steps={:>6,}  VAL cost={:9.1f} +/-{:7.1f}  service={:.3f}{}".format(
-            done_steps, m["avg_cost"], m["std_cost"], m["avg_service_level"], star))
+    best_path = "artifacts/dqn_best"
+
+    class PeriodicEval(BaseCallback):
+        """Evaluate inside a SINGLE learn() call.
+
+        Calling learn(chunk, reset_num_timesteps=False) in a loop makes SB3 recompute
+        _total_timesteps per call, so the epsilon schedule collapses to its floor
+        inside the first chunk and the agent stops exploring for the rest of the run
+        (measured: eps pinned at 0.010 across all 60k steps). One learn() call keeps
+        the schedule intact.
+        """
+
+        def __init__(self, every):
+            super().__init__()
+            self.every = every
+            self.best = None
+
+        def _on_step(self):
+            if self.num_timesteps % self.every:
+                return True
+            m = evaluate_policy(val_env, dqn_policy, n_episodes=args.eval_episodes)
+            curve.append(dict(steps=self.num_timesteps, eps=float(self.model.exploration_rate), **m))
+            star = ""
+            if self.best is None or m["avg_cost"] < self.best:
+                self.best = m["avg_cost"]; self.model.save(best_path); star = "  <- best so far"
+            log("  steps={:>6,}  VAL cost={:9.1f} +/-{:7.1f}  service={:.3f}  eps={:.3f}{}".format(
+                self.num_timesteps, m["avg_cost"], m["std_cost"], m["avg_service_level"],
+                float(self.model.exploration_rate), star))
+            return True
+
+    cb = PeriodicEval(args.eval_every)
+    agent.learn(total_timesteps=args.timesteps, callback=cb, progress_bar=False)
+    best_val = cb.best
 
     from stable_baselines3 import DQN as _DQN
     agent = _DQN.load(best_path)
