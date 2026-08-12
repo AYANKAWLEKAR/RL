@@ -9,6 +9,7 @@ from src.forecasting import (
     ForecastDatasetBundle,
     NeuralForecastAdapter,
     PersistenceForecaster,
+    ZeroForecaster,
     choose_best_forecaster,
     evaluate_forecaster,
     export_rl_forecast_features,
@@ -114,6 +115,53 @@ def test_neural_forecast_adapter_covers_full_evaluation_split():
     assert preds["ds"].min() == bundle.test_df["ds"].min()
     assert preds["ds"].max() == bundle.test_df["ds"].max()
     assert len(preds) == len(bundle.test_df)
+
+
+def test_zero_forecaster_is_the_control_for_sparse_targets(split_hourly_df: pd.DataFrame):
+    """On intermittent demand, MAE is minimized by the conditional median, which is
+    zero when most periods are zero. ZeroForecaster makes that floor explicit so a
+    model's MAE is never mistaken for skill.
+    """
+    bundle = prepare_forecast_frames(split_hourly_df, ForecastConfig())
+    metrics, preds = evaluate_forecaster(ZeroForecaster(), bundle, use_log_target=True, evaluation_split="val")
+
+    assert (preds["model_prediction"] == 0.0).all()
+    # MAE of the all-zeros forecast is exactly the mean of |actual|.
+    assert metrics.mae == pytest.approx(preds["actual"].abs().mean(), rel=1e-9)
+    # It never over-forecasts, so bias is the negative of the mean level.
+    assert metrics.bias <= 0.0
+
+
+def test_adapter_prefers_median_column_under_quantile_loss():
+    """Under MQLoss the output has median/lo/hi columns in no guaranteed order, so
+    taking the first column can score a tail quantile as the point forecast.
+    """
+    bundle = ForecastDatasetBundle(
+        full_df=pd.DataFrame(), train_df=pd.DataFrame(), val_df=pd.DataFrame(), test_df=pd.DataFrame(),
+        static_df=pd.DataFrame(), future_cols=[], historic_cols=[], target_col="y_model", raw_target_col="y",
+    )
+
+    class _FakeNF:
+        def make_future_dataframe(self, df=None):
+            return pd.DataFrame({"unique_id": ["A"], "ds": [pd.Timestamp("2024-01-02")]})
+
+        def predict(self, df=None, static_df=None, futr_df=None):
+            # deliberately puts a tail quantile first
+            return pd.DataFrame({
+                "unique_id": ["A"], "ds": [pd.Timestamp("2024-01-02")],
+                "TFT-lo-80": [1.0], "TFT-median": [5.0], "TFT-hi-80": [9.0],
+            })
+
+    class _Model:
+        h = 1
+
+    adapter = NeuralForecastAdapter(_Model(), "TFT")
+    adapter._nf = _FakeNF()
+    history = pd.DataFrame({"unique_id": ["A"], "ds": [pd.Timestamp("2024-01-01")], "y_model": [3.0]})
+    future = pd.DataFrame({"unique_id": ["A"], "ds": [pd.Timestamp("2024-01-02")], "y_model": [4.0]})
+
+    out = adapter.predict(history, future, bundle)
+    assert out["prediction"].iloc[0] == 5.0, "should select TFT-median, not the first column"
 
 
 def test_export_rl_forecast_features_produces_stable_schema(split_hourly_df: pd.DataFrame):
