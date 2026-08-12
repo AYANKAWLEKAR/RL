@@ -172,9 +172,22 @@ def backtest_reconstruction(
     config: LatentDemandConfig | None = None,
     max_samples: int = 256,
     reconstruction_cutoff: pd.Timestamp | None = None,
+    _train_frame: pd.DataFrame | None = None,
+    _model: HistGradientBoostingRegressor | None = None,
 ) -> ReconstructionDiagnostics:
+    """Diagnostics for the stockout imputation model.
+
+    `_train_frame` / `_model` let a caller that has already built the training
+    frame and fit the model hand them in. reconstruct_latent_demand does exactly
+    that: without it, this function would rebuild the frame and fit a second,
+    identical GBM, doubling the most expensive part of the pipeline.
+    """
     config = config or LatentDemandConfig()
-    train_frame = _build_reconstruction_training_frame(prepared_df, config, cutoff=reconstruction_cutoff)
+    train_frame = (
+        _train_frame
+        if _train_frame is not None
+        else _build_reconstruction_training_frame(prepared_df, config, cutoff=reconstruction_cutoff)
+    )
     if train_frame.empty:
         return ReconstructionDiagnostics(
             model_used=False,
@@ -184,8 +197,8 @@ def backtest_reconstruction(
             fallback_mean_hours=0,
         )
 
-    model = None
-    if len(train_frame) >= config.model_min_training_rows:
+    model = _model
+    if model is None and len(train_frame) >= config.model_min_training_rows:
         model = HistGradientBoostingRegressor(random_state=config.random_state)
         model.fit(_model_feature_frame(train_frame), train_frame["target"])
 
@@ -230,8 +243,17 @@ def reconstruct_latent_demand(
     source_counts: dict[str, int] = {}
     reconstructed_groups: list[pd.DataFrame] = []
 
+    # Model-imputed hours are collected here and predicted in ONE batched call after
+    # the loop. Calling model.predict() on a one-row DataFrame per stockout hour is
+    # dominated by per-call overhead (~292k calls on a 500-series slice). This is
+    # safe because every imputation is independent: the heuristic reads `sales` and
+    # `status`, which are never mutated, and `latent` is written but never read.
+    pending_rows: list[dict[str, Any]] = []
+    pending_slots: list[tuple[int, int, int]] = []
+    latents: list[np.ndarray] = []
+
     grouped = prepared.groupby(["product_id", "store_id"], sort=False)
-    for _, group in grouped:
+    for group_pos, (_, group) in enumerate(grouped):
         group = group.sort_values("dt").reset_index(drop=True)
         sales = np.stack(group["hours_sale"].values)
         status = np.stack(group["hours_stock_status"].values)
@@ -240,47 +262,61 @@ def reconstruct_latent_demand(
         for day_idx in range(len(group)):
             stockout_hours = np.where(status[day_idx] == 1)[0]
             total_stockout_hours += len(stockout_hours)
+            stockout_len = int(len(stockout_hours))
+            day_row = group.loc[day_idx]
             for hour_idx in stockout_hours:
-                stockout_len = int(np.sum(status[day_idx] == 1))
                 estimate, source = _same_hour_heuristic(sales, status, day_idx, hour_idx, config)
                 if model is not None and stockout_len > config.short_stockout_max_hours:
-                    model_row = pd.DataFrame(
-                        [
-                            {
-                                "hour": hour_idx,
-                                "day_of_week": group.loc[day_idx, "dt"].dayofweek,
-                                "month": group.loc[day_idx, "dt"].month,
-                                "discount": float(group.loc[day_idx].get("discount", 0.0)),
-                                "holiday_flag": int(group.loc[day_idx].get("holiday_flag", 0)),
-                                "activity_flag": int(group.loc[day_idx].get("activity_flag", 0)),
-                                "precpt": float(group.loc[day_idx].get("precpt", 0.0)),
-                                "avg_temperature": float(group.loc[day_idx].get("avg_temperature", 0.0)),
-                                "avg_humidity": float(group.loc[day_idx].get("avg_humidity", 0.0)),
-                                "avg_wind_level": float(group.loc[day_idx].get("avg_wind_level", 0.0)),
-                                "sale_amount": float(group.loc[day_idx].get("sale_amount", np.sum(sales[day_idx]))),
-                                "store_id": int(group.loc[day_idx].get("store_id", 0)),
-                                "product_id": int(group.loc[day_idx].get("product_id", 0)),
-                                "first_category_id": int(group.loc[day_idx].get("first_category_id", 0)),
-                            }
-                        ]
+                    pending_rows.append(
+                        {
+                            "hour": hour_idx,
+                            "day_of_week": day_row["dt"].dayofweek,
+                            "month": day_row["dt"].month,
+                            "discount": float(day_row.get("discount", 0.0)),
+                            "holiday_flag": int(day_row.get("holiday_flag", 0)),
+                            "activity_flag": int(day_row.get("activity_flag", 0)),
+                            "precpt": float(day_row.get("precpt", 0.0)),
+                            "avg_temperature": float(day_row.get("avg_temperature", 0.0)),
+                            "avg_humidity": float(day_row.get("avg_humidity", 0.0)),
+                            "avg_wind_level": float(day_row.get("avg_wind_level", 0.0)),
+                            "sale_amount": float(day_row.get("sale_amount", np.sum(sales[day_idx]))),
+                            "store_id": int(day_row.get("store_id", 0)),
+                            "product_id": int(day_row.get("product_id", 0)),
+                            "first_category_id": int(day_row.get("first_category_id", 0)),
+                        }
                     )
-                    estimate = float(model.predict(_model_feature_frame(model_row))[0])
-                    source = "model_fallback"
+                    pending_slots.append((group_pos, int(day_idx), int(hour_idx)))
+                    continue
 
                 latent[day_idx, hour_idx] = max(0.0, estimate if estimate is not None else 0.0)
                 source_counts[source] = source_counts.get(source, 0) + 1
                 if source == "heuristic_same_hour":
                     heuristic_imputed_hours += 1
-                elif source == "model_fallback":
-                    model_imputed_hours += 1
                 else:
                     fallback_mean_hours += 1
 
         out = group.copy()
-        out["latent_demand"] = list(latent)
+        latents.append(latent)
         reconstructed_groups.append(out)
 
-    diagnostics = backtest_reconstruction(prepared, config=config, reconstruction_cutoff=reconstruction_cutoff)
+    if pending_rows:
+        batch = pd.DataFrame.from_records(pending_rows)
+        predictions = model.predict(_model_feature_frame(batch))
+        for (group_pos, day_idx, hour_idx), predicted in zip(pending_slots, predictions):
+            latents[group_pos][day_idx, hour_idx] = max(0.0, float(predicted))
+        model_imputed_hours += len(pending_slots)
+        source_counts["model_fallback"] = source_counts.get("model_fallback", 0) + len(pending_slots)
+
+    for out, latent in zip(reconstructed_groups, latents):
+        out["latent_demand"] = list(latent)
+
+    diagnostics = backtest_reconstruction(
+        prepared,
+        config=config,
+        reconstruction_cutoff=reconstruction_cutoff,
+        _train_frame=train_frame,
+        _model=model,
+    )
     diagnostics.model_used = model is not None
     diagnostics.total_stockout_hours = total_stockout_hours
     diagnostics.heuristic_imputed_hours = heuristic_imputed_hours
