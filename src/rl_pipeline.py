@@ -49,6 +49,15 @@ class InventoryEnvConfig:
     # always exactly 0.0, making "average over N episodes" meaningless.
     random_start: bool = True
 
+    # Express state and actions in DAYS OF COVER rather than absolute units, using a
+    # per-series demand scale. Required for one shared policy over many products:
+    # real series span 5.4-28.2 units/day (5.2x), so an absolute action means totally
+    # different things per product - level 4 (=20 units) is 4 days of cover for a
+    # 5/day series and 0.7 days for a 28/day one. Off by default so single-product
+    # behavior is unchanged.
+    scale_normalize: bool = False
+    order_level_days: float = 0.5  # days of cover per action level when scale_normalize
+
     @property
     def max_order(self) -> float:
         """Largest orderable quantity, implied by the order-up-to grid."""
@@ -100,6 +109,11 @@ class InventoryEnv(gym.Env):
             raise ValueError("covariate_matrix must align with demand_series length")
         self.episode_length = min(self.config.episode_length, len(self.demand))
         self.n_cov = self.covariates.shape[1] if self.covariates is not None else 0
+        # Demand scale for this series, used only when scale_normalize is on. A single
+        # product needs no cross-series normalization, so it defaults to its own mean.
+        self.scale = float(np.mean(self.demand)) if len(self.demand) else 1.0
+        if not np.isfinite(self.scale) or self.scale <= 0:
+            self.scale = 1.0
 
         # The old layout reserved 2 slots for price/discount that were hardcoded to
         # [1.0, 1.0] and never populated. Real exogenous signal belongs in
@@ -115,8 +129,14 @@ class InventoryEnv(gym.Env):
         (demand up to 28/day at lead_time=2 needs ~84 units of cover). Targeting a
         position and ordering the shortfall makes the same action grid work across
         demand scales, and makes the (s,S) baseline expressible in the same space.
+
+        Under scale_normalize the level is DAYS OF COVER, converted to units with this
+        series' demand scale, so one shared policy transfers across demand scales.
         """
-        target = float(action) * self.config.order_level_step
+        if self.config.scale_normalize:
+            target = float(action) * self.config.order_level_days * self.scale
+        else:
+            target = float(action) * self.config.order_level_step
         position = self.inventory + float(self.pipeline.sum())
         return max(0.0, target - position)
 
@@ -230,6 +250,7 @@ class CategoryInventoryEnv(gym.Env):
         forecast_series_list: list[np.ndarray] | None = None,
         uid_list: list[str] | None = None,
         config: InventoryEnvConfig | None = None,
+        scales: list[float] | None = None,
     ):
         super().__init__()
         if len(demand_series_list) == 0:
@@ -238,6 +259,16 @@ class CategoryInventoryEnv(gym.Env):
         self.demand_list = [np.asarray(d, dtype=np.float32) for d in demand_series_list]
         if any(len(d) == 0 for d in self.demand_list):
             raise ValueError("all demand series must be non-empty")
+
+        # Per-series demand scale. Callers should pass scales estimated on the TRAIN
+        # split so the value is causal; falling back to this env's own mean is fine for
+        # a training env but would peek at held-out demand in an evaluation env.
+        if scales is not None:
+            if len(scales) != len(demand_series_list):
+                raise ValueError("scales must align with demand_series_list")
+            self.scales = [float(s) if np.isfinite(s) and s > 0 else 1.0 for s in scales]
+        else:
+            self.scales = [float(np.mean(d)) if np.mean(d) > 0 else 1.0 for d in self.demand_list]
 
         self.forecast_list = None
         if forecast_series_list is not None:
@@ -255,6 +286,7 @@ class CategoryInventoryEnv(gym.Env):
         self._current_idx = 0
         self._start = 0
         self.demand = self.demand_list[0]
+        self.scale = self.scales[0]
         self.forecasts = self.forecast_list[0] if self.forecast_list else None
 
     _order_from_action = InventoryEnv._order_from_action
@@ -263,6 +295,7 @@ class CategoryInventoryEnv(gym.Env):
         super().reset(seed=seed)
         self._current_idx = int(self.np_random.integers(0, self.n_products))
         self.demand = self.demand_list[self._current_idx]
+        self.scale = self.scales[self._current_idx]
         self.forecasts = self.forecast_list[self._current_idx] if self.forecast_list else None
         self._ep_len = min(self.config.episode_length, len(self.demand))
         self._start = 0
@@ -282,6 +315,24 @@ class CategoryInventoryEnv(gym.Env):
 
     def _get_obs(self):
         fc = self._forecast_block()
+        if self.config.scale_normalize:
+            # Everything in DAYS OF COVER so the state distribution is comparable
+            # across products, plus log1p(scale) so the agent still knows the absolute
+            # size of the series it is currently facing.
+            s = self.scale
+            return np.concatenate(
+                [
+                    [np.log1p(s)],
+                    [self.inventory / s],
+                    self.pipeline / s,
+                    fc / s,
+                    self.stockout_history,
+                ]
+            ).astype(np.float32)
+        # Legacy layout. NOTE: _current_idx is an arbitrary ordinal position in the
+        # series list and carries no information about the product - it cannot tell a
+        # 5 unit/day series from a 28 unit/day one. Prefer scale_normalize for any
+        # policy shared across products.
         product_norm = self._current_idx / max(self.n_products - 1, 1)
         return np.concatenate(
             [[product_norm], [self.inventory], self.pipeline, fc, self.stockout_history]
@@ -467,6 +518,71 @@ def make_category_env(
     )
 
 
+def compute_train_scales(hourly_df: pd.DataFrame, uids: list[str]) -> dict[str, float]:
+    """Mean daily demand per series, measured on the TRAIN split only.
+
+    Used as the demand scale for scale_normalize. Measuring it on train keeps it
+    causal: an evaluation env must not derive its normalization from held-out demand.
+    """
+    train = hourly_df[(hourly_df["split"] == "train") & (hourly_df["unique_id"].isin(uids))].copy()
+    if len(train) == 0:
+        return {u: 1.0 for u in uids}
+    train["date"] = train["ds"].dt.date
+    daily = train.groupby(["unique_id", "date"], as_index=False)["y"].sum()
+    means = daily.groupby("unique_id")["y"].mean()
+    return {u: float(means.get(u, 1.0)) if means.get(u, 0.0) > 0 else 1.0 for u in uids}
+
+
+def make_multi_product_env(
+    hourly_df: pd.DataFrame,
+    uids: list[str],
+    split: str = "train",
+    forecast_df: pd.DataFrame | None = None,
+    config: InventoryEnvConfig | None = None,
+    min_series_days: int = 15,
+    scales: dict[str, float] | None = None,
+    on_missing_forecast: str = "naive",
+) -> CategoryInventoryEnv:
+    """Build one env over an arbitrary set of product-stores, across any categories.
+
+    `make_category_env` is limited to a single `first_category_id`. Training one policy
+    over MANY categories is the main lever against the overfitting documented in
+    design.md Part 8: a single product yields ~51 distinct episode windows, while
+    hundreds of series yield orders of magnitude more.
+
+    Pass `scales` (from `compute_train_scales`) so evaluation envs normalize using
+    train-split statistics rather than their own held-out demand.
+    """
+    config = config or InventoryEnvConfig()
+    demand_list: list[np.ndarray] = []
+    forecast_list: list[np.ndarray] = []
+    uid_list: list[str] = []
+    scale_list: list[float] = []
+
+    for uid in uids:
+        demand, forecasts = _aligned_daily_series(hourly_df, uid, split, forecast_df)
+        if len(demand) < min_series_days:
+            continue
+        if forecast_df is not None and forecasts is None and on_missing_forecast == "raise":
+            raise ValueError(f"No forecast data for uid={uid}, split={split}")
+        demand_list.append(demand)
+        uid_list.append(uid)
+        scale_list.append(float(scales[uid]) if scales and uid in scales else float(np.mean(demand)))
+        if forecasts is not None:
+            forecast_list.append(forecasts)
+
+    if len(demand_list) == 0:
+        raise ValueError(f"No series met min_series_days={min_series_days} for split={split}")
+
+    return CategoryInventoryEnv(
+        demand_series_list=demand_list,
+        forecast_series_list=forecast_list if len(forecast_list) == len(demand_list) else None,
+        uid_list=uid_list,
+        config=config,
+        scales=scale_list,
+    )
+
+
 def evaluate_policy(env, policy_fn, n_episodes: int = 5) -> dict[str, float]:
     total_costs = []
     service_levels = []
@@ -494,9 +610,31 @@ def _inventory_position(obs, env) -> float:
 
 
 def _level_for_target(target: float, env) -> int:
-    """Map a desired inventory position onto the env's order-up-to action grid."""
-    level = int(round(target / env.config.order_level_step))
+    """Map a desired inventory position (in UNITS) onto the env's action grid."""
+    if env.config.scale_normalize:
+        step = env.config.order_level_days * getattr(env, "scale", 1.0)
+    else:
+        step = env.config.order_level_step
+    level = int(round(target / max(step, 1e-9)))
     return int(np.clip(level, 0, env.config.n_order_levels))
+
+
+def sS_policy_scaled(obs, env, s_days: float = 1.5, S_days: float = 4.0) -> int:
+    """(s,S) expressed in DAYS OF COVER, so one parameter pair fits every product.
+
+    The unit-based sS_policy cannot be fair across a 5x demand range: an (s,S) of
+    (20, 50) units is ~4 days of cover for a 5/day series and under 2 days for a
+    28/day one. Scaling by the series' demand is what lets a single baseline compete
+    with a single shared policy.
+    """
+    scale = getattr(env, "scale", 1.0) or 1.0
+    # Under scale_normalize the observation is already divided by scale, so
+    # _inventory_position returns DAYS of cover; otherwise it returns units.
+    position = _inventory_position(obs, env)
+    threshold = s_days if env.config.scale_normalize else s_days * scale
+    if position <= threshold:
+        return _level_for_target(S_days * scale, env)
+    return 0
 
 
 def sS_policy(obs, env, s: float = 10, S: float = 30) -> int:

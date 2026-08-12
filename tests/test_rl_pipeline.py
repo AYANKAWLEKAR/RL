@@ -12,6 +12,8 @@ from src.rl_pipeline import (
     InventoryEnvConfig,
     _get_daily_demand,
     _get_daily_forecast,
+    compute_train_scales,
+    make_multi_product_env,
     build_dqn_agent,
     evaluate_policy,
     make_category_env,
@@ -157,6 +159,86 @@ def test_reward_is_scaled_but_total_cost_stays_raw():
     _, reward, _, _, info = env.step(4)
     assert reward == pytest.approx(-info["step_cost"] * cfg.reward_scale)
     assert env.total_cost == pytest.approx(info["step_cost"]), "total_cost stays in raw units"
+
+
+def test_scale_normalize_makes_one_action_mean_the_same_thing_across_scales():
+    """A shared policy needs actions in DAYS OF COVER, not absolute units.
+
+    Real series span 5.4-28.2 units/day. Unnormalized, action 4 (=20 units) is 4 days
+    of cover for a 5/day series and 0.7 days for a 28/day one, so the same action means
+    different things and no single policy can be right for both.
+    """
+    small = np.full(60, 5.0, dtype=np.float32)
+    large = np.full(60, 28.0, dtype=np.float32)
+
+    plain = InventoryEnvConfig(scale_normalize=False, order_level_step=5.0, random_start=False)
+    env = CategoryInventoryEnv([small, large], config=plain, scales=[5.0, 28.0])
+    env.reset(seed=0)
+    env.inventory, env.pipeline = 0.0, np.zeros(plain.lead_time, dtype=np.float32)
+    env.scale = 5.0
+    small_units = env._order_from_action(4)
+    env.scale = 28.0
+    large_units = env._order_from_action(4)
+    assert small_units == large_units == 20.0, "unnormalized: identical units, different cover"
+    assert small_units / 5.0 != pytest.approx(large_units / 28.0), "cover differs wildly"
+
+    scaled = InventoryEnvConfig(scale_normalize=True, order_level_days=0.5, random_start=False)
+    env2 = CategoryInventoryEnv([small, large], config=scaled, scales=[5.0, 28.0])
+    env2.reset(seed=0)
+    env2.inventory, env2.pipeline = 0.0, np.zeros(scaled.lead_time, dtype=np.float32)
+    env2.scale = 5.0
+    s_units = env2._order_from_action(4)
+    env2.scale = 28.0
+    l_units = env2._order_from_action(4)
+    # same DAYS of cover on both, even though the unit counts differ
+    assert s_units / 5.0 == pytest.approx(l_units / 28.0) == pytest.approx(2.0)
+
+
+def test_scale_normalized_observation_is_comparable_across_products():
+    """Two products differing only in scale should look identical in days-of-cover."""
+    cfg = InventoryEnvConfig(scale_normalize=True, forecast_horizon=3, lead_time=2,
+                             stockout_history_len=2, episode_length=20, random_start=False)
+    small = np.full(40, 5.0, dtype=np.float32)
+    large = np.full(40, 25.0, dtype=np.float32)
+    env = CategoryInventoryEnv([small, large], forecast_series_list=[small, large],
+                               config=cfg, scales=[5.0, 25.0])
+
+    env.reset(seed=0)
+    env._current_idx, env.demand, env.scale = 0, small, 5.0
+    env.forecasts = small
+    env.inventory = 10.0  # 2 days of cover
+    obs_small = env._get_obs()
+
+    env._current_idx, env.demand, env.scale = 1, large, 25.0
+    env.forecasts = large
+    env.inventory = 50.0  # also 2 days of cover
+    obs_large = env._get_obs()
+
+    # index 1 is inventory in days of cover; forecast block likewise
+    assert obs_small[1] == pytest.approx(obs_large[1]) == pytest.approx(2.0)
+    assert np.allclose(obs_small[2:], obs_large[2:]), "only the scale feature should differ"
+    assert obs_small[0] != obs_large[0], "log1p(scale) still identifies absolute size"
+
+
+def test_make_multi_product_env_spans_categories_and_uses_train_scales():
+    ds = pd.date_range("2024-01-01", periods=24 * 40, freq="h")
+    frames = []
+    for uid, cat, level in [("a", 10, 1.0), ("b", 10, 4.0), ("c", 99, 2.0)]:
+        f = pd.DataFrame({"unique_id": uid, "ds": ds, "y": level, "first_category_id": cat})
+        f["split"] = "train"
+        f.loc[f.index[-24 * 10:], "split"] = "test"
+        frames.append(f)
+    hourly = pd.concat(frames, ignore_index=True)
+
+    uids = ["a", "b", "c"]
+    scales = compute_train_scales(hourly, uids)
+    assert scales["a"] == pytest.approx(24.0)
+    assert scales["b"] == pytest.approx(96.0)
+
+    env = make_multi_product_env(hourly, uids, split="test", config=InventoryEnvConfig(episode_length=5),
+                                 min_series_days=5, scales=scales)
+    assert env.n_products == 3, "spans both categories, unlike make_category_env"
+    assert env.scales == [pytest.approx(24.0), pytest.approx(96.0), pytest.approx(48.0)]
 
 
 def test_category_env_samples_products():
