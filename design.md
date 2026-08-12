@@ -259,3 +259,55 @@ gets worse and more honest.
 beating it is a **high bar, not a formality**. If DQN loses after a correct comparison,
 that is a legitimate result worth writing down. Tuning until it wins and reporting only
 that run is the same failure mode that produced the original `0.05 MAE`.
+
+---
+
+## Part 7 — RL results (single-product DQN)
+
+Product `691_843`, 7.93 units/day (mid-range by construction, so the result is not an
+artifact of a distribution edge). Test split, 40 episodes, `random_start`.
+
+| Policy | Cost | ± sd | Service level |
+|---|---|---|---|
+| **DQN** | **385.1** | 60.5 | 0.778 |
+| (s,S) | 517.1 | 108.3 | 0.713 |
+| EOQ | 620.9 | 80.5 | 0.658 |
+| NeverOrder | 1737.2 | 115.8 | 0.145 |
+
+**DQN beats a val-tuned (s,S) by 25.5%** — at a *higher* service level (0.778 vs
+0.713), so it is not buying cost savings by refusing to stock. Welch's t = −6.73
+(df ≈ 61); the 95% CIs do not overlap ([366, 404] vs [484, 551]), so the gap is not
+noise. The rollout uses 6 distinct order sizes with 50% zeros — not degenerate.
+
+Learning curve (val) shows genuine learning then overfitting: 258 → 190 → **186 at
+15k** → drifting up to 378 by 60k. The best-on-val checkpoint is what gets scored.
+
+### Three methodology errors caught while producing this
+
+Recorded because each one *changed the answer*, and the first two would have shipped a
+wrong conclusion in opposite directions.
+
+1. **Baseline overfit to test.** `(s,S)` was originally grid-searched on the test
+   split, scoring 366.7. Tuned honestly on val it scores **841.0** on test. The first
+   run therefore reported "DQN loses by 118.8%" against an opponent that had seen the
+   test set. Both sides are now tuned/selected on val and scored once on test.
+2. **Test leakage into checkpoint selection.** The learning curve originally ran on
+   *test*, and the reported model was the *final* checkpoint rather than the best.
+   Now the curve runs on val, and the best-on-val checkpoint is restored before the
+   single test evaluation.
+3. **Zero evaluation variance.** `std_cost` was exactly 0.0 because the launcher
+   passed `--episode-length 60` against a 15-day test split: `min(60,15)=15` leaves no
+   slack for `random_start`, so all 40 "episodes" were one episode repeated. With
+   `episode_length=10` there are 6 distinct starts and the numbers carry real error
+   bars. Every figure before this fix was a single-episode point estimate.
+
+### Caveats on this result
+
+- **One product, one seed.** No claim of generality. The category-level agent is
+  untrained, and no seed-variance study was run.
+- **Short horizons.** 61 train days / 16 val / 15 test, episodes of 10 days. The
+  `initial_inventory=20` warmup is a meaningful share of a 10-day episode.
+- **Unstable training.** Val cost degrades after ~15k steps. Best-on-val checkpointing
+  handles it, but a genuinely converged agent would not need rescuing.
+- **The imputation caveat from Part 5 still applies** — a third of the demand the
+  agent optimizes against is GBM-generated.
