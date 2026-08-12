@@ -117,6 +117,34 @@ def test_neural_forecast_adapter_covers_full_evaluation_split():
     assert len(preds) == len(bundle.test_df)
 
 
+def test_val_size_is_per_series_not_total_rows():
+    """NeuralForecast's val_size counts PER-SERIES timesteps, not dataframe rows.
+
+    Passing len(val_df) happens to work with 1-2 series and fails hard on a real
+    panel: with 502 series x ~1629 train steps, len(val_df)=175198 made
+    fit() compute 1629 - 175198 = -173569 available steps and raise.
+    """
+    class _Model:
+        input_size = 168
+        h = 24
+
+    adapter = NeuralForecastAdapter(_Model(), "TFT")
+    n_series, train_steps, val_steps = 60, 1000, 200
+    train_df = pd.DataFrame({"unique_id": np.repeat([f"s{i}" for i in range(n_series)], train_steps)})
+    val_df = pd.DataFrame({"unique_id": np.repeat([f"s{i}" for i in range(n_series)], val_steps)})
+
+    val_size = adapter._val_size(train_df, val_df)
+
+    assert val_size == val_steps, "should be per-series steps, not len(val_df)"
+    assert val_size < len(val_df), "using the raw row count is the bug this guards"
+    # every series must retain enough history to form at least one training window
+    assert train_steps - val_size >= _Model.input_size + _Model.h
+
+    # clamped when the requested holdout would starve training
+    greedy_val = pd.DataFrame({"unique_id": np.repeat([f"s{i}" for i in range(n_series)], 990)})
+    assert adapter._val_size(train_df, greedy_val) == train_steps - _Model.input_size - _Model.h
+
+
 def test_zero_forecaster_is_the_control_for_sparse_targets(split_hourly_df: pd.DataFrame):
     """On intermittent demand, MAE is minimized by the conditional median, which is
     zero when most periods are zero. ZeroForecaster makes that floor explicit so a

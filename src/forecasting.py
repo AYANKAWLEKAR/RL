@@ -233,7 +233,25 @@ class NeuralForecastAdapter:
         # bundle.target_col is "y_model" whenever a log1p transform is applied, so it
         # must be renamed here or fit() raises KeyError('y').
         nf_train = train_df[cols].rename(columns={bundle.target_col: "y"})
-        self._nf.fit(df=nf_train, static_df=bundle.static_df, val_size=len(val_df))
+        self._nf.fit(df=nf_train, static_df=bundle.static_df, val_size=self._val_size(train_df, val_df))
+
+    def _val_size(self, train_df: pd.DataFrame, val_df: pd.DataFrame) -> int:
+        """Early-stopping holdout, in PER-SERIES timesteps.
+
+        NeuralForecast's `val_size` is a number of timesteps carved off the end of
+        each series, NOT a row count. Passing len(val_df) works by accident with one
+        or two series and explodes on a real panel: with 502 series each having
+        ~1,629 train steps, len(val_df)=175,198 gives 1,629 - 175,198 = -173,569 and
+        fit() raises. Convert to per-series, then clamp so every series retains at
+        least input_size + h steps to actually train on.
+        """
+        n_series = max(int(train_df["unique_id"].nunique()), 1)
+        per_series_val = int(len(val_df) // n_series)
+        per_series_train = int(len(train_df) // n_series)
+        input_size = int(getattr(self.model, "input_size", 0) or 0)
+        horizon = int(getattr(self.model, "h", 0) or 0)
+        headroom = per_series_train - input_size - horizon
+        return int(max(0, min(per_series_val, max(0, headroom))))
 
     def predict(self, history_df: pd.DataFrame, future_df: pd.DataFrame, bundle: ForecastDatasetBundle) -> pd.DataFrame:
         if self._nf is None:
