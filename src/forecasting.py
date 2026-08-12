@@ -283,6 +283,27 @@ class NeuralForecastAdapter:
         headroom = per_series_train - input_size - horizon
         return int(max(0, min(per_series_val, max(0, headroom))))
 
+    def _trim_history(self, history: pd.DataFrame) -> pd.DataFrame:
+        """Keep only the most recent steps each series needs to condition on.
+
+        The model conditions on `input_size` steps, so carrying the full accumulated
+        history forward makes each window re-process everything seen so far - O(n^2)
+        across the walk. On 502 series x 68 windows that dominated runtime (~14 min
+        for a single split). Trimming is result-neutral: anything older than
+        input_size cannot enter the encoder window anyway.
+        """
+        input_size = int(getattr(self.model, "input_size", 0) or 0)
+        horizon = int(getattr(self.model, "h", 0) or 0)
+        keep = input_size + horizon
+        if keep <= 0:
+            return history
+        return (
+            history.sort_values(["unique_id", "ds"])
+            .groupby("unique_id", sort=False, group_keys=False)
+            .tail(keep)
+            .reset_index(drop=True)
+        )
+
     def predict(self, history_df: pd.DataFrame, future_df: pd.DataFrame, bundle: ForecastDatasetBundle) -> pd.DataFrame:
         if self._nf is None:
             raise RuntimeError("Adapter must be fit before predict")
@@ -297,7 +318,7 @@ class NeuralForecastAdapter:
         # global date union, because per-series history can end at slightly
         # different timestamps (e.g. differing NaN-drop counts from lag features).
         cols = ["unique_id", "ds", bundle.target_col] + bundle.future_cols + bundle.historic_cols
-        rolling_history = history_df[cols].rename(columns={bundle.target_col: "y"})
+        rolling_history = self._trim_history(history_df[cols].rename(columns={bundle.target_col: "y"}))
         future_exog = future_df[["unique_id", "ds"] + bundle.future_cols]
         future_actuals = future_df[cols].rename(columns={bundle.target_col: "y"})
         max_ds = future_df["ds"].max()
@@ -320,6 +341,7 @@ class NeuralForecastAdapter:
             if next_actuals.empty:
                 break
             rolling_history = pd.concat([rolling_history, next_actuals], ignore_index=True)
+            rolling_history = self._trim_history(rolling_history)
 
         if not forecasts:
             return pd.DataFrame(columns=["unique_id", "ds", "prediction"])
