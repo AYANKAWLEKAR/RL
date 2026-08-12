@@ -371,3 +371,40 @@ remedies are:
    build the category agent beyond the product claim itself.
 3. **Smaller budget.** 60k steps over 51 windows is far past the point of return;
    the seed study uses 30k.
+
+---
+
+## Part 9 — Seed-variance study
+
+The headline result was one seed. RL results are notoriously seed-sensitive, so a
+single-seed win is weak evidence. Re-ran the full protocol across 5 seeds with the
+ε-schedule repaired and a 30k budget (past that, Part 8 shows only overfitting).
+
+`(s,S)` tuned on val → (20, 50), test cost **493.1** (±83.7, n=40).
+
+| Seed | best val | test cost | ± sd | service |
+|---|---|---|---|---|
+| 0 | 161.8 | 336.7 | 81.1 | 0.780 |
+| 1 | 158.9 | 328.9 | 94.6 | 0.773 |
+| 2 | 163.8 | 325.2 | 79.7 | 0.797 |
+| 3 | 185.8 | 327.8 | 113.4 | 0.708 |
+| 4 | 183.2 | 412.9 | 79.0 | 0.705 |
+
+**DQN mean 346.3, sd 37.5 — beats `(s,S)` on 5/5 seeds, +29.8% mean improvement.**
+95% CI across seeds [299.8, 392.8] excludes 493.1; Welch t = −6.87. Even the **worst**
+seed (412.9) beats the baseline. The result is robust, not a lucky initialization.
+
+Two honest notes:
+
+- Seed 4 is a visible outlier (412.9 vs ~330 for the rest) and has the lowest service
+  level. Seed sensitivity is real even though every seed wins.
+- The 30k-budget mean (346.3) is *better* than the original 60k single-seed number
+  (385.1), consistent with Part 8: the longer budget was training past the overfitting
+  point, and best-on-val checkpointing was rescuing a worse run.
+
+### Scope of the claim
+
+One product, one demand band (7.93 units/day), one cost configuration. This says DQN
+can beat a tuned `(s,S)` on *this* problem instance, robustly across seeds. It does not
+establish that it generalizes across products, demand scales, or cost structures — that
+is what the untrained category agent would test.
