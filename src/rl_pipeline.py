@@ -359,6 +359,44 @@ def _get_daily_forecast(forecast_df: pd.DataFrame | None, uid: str, split_dates:
     return daily["forecast_median"].to_numpy(dtype=np.float32)
 
 
+def _aligned_daily_series(
+    hourly_df: pd.DataFrame,
+    uid: str,
+    split: str,
+    forecast_df: pd.DataFrame | None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Return (demand, forecast) as daily arrays aligned on their common dates.
+
+    Demand and forecast rarely span identical dates: a model cannot forecast the first
+    `input_size` steps of a series (nothing precedes them), and the final walk-forward
+    window usually overshoots the split's end. Rather than pad those days with invented
+    numbers, both series are inner-joined on date so every index refers to the same day.
+    The cost is a short unforecastable warmup at the start of the split.
+    """
+    series = hourly_df[(hourly_df["unique_id"] == uid) & (hourly_df["split"] == split)].sort_values("ds").copy()
+    if len(series) == 0:
+        return np.array([], dtype=np.float32), None
+    series["date"] = series["ds"].dt.date
+    daily = series.groupby("date", as_index=False)["y"].sum()
+
+    if forecast_df is None:
+        return daily["y"].to_numpy(dtype=np.float32), None
+
+    fc = forecast_df[forecast_df["unique_id"] == uid].copy()
+    if len(fc) == 0:
+        return daily["y"].to_numpy(dtype=np.float32), None
+    fc["date"] = fc["ds"].dt.date
+    fc_daily = fc.groupby("date", as_index=False)["forecast_median"].sum()
+
+    merged = daily.merge(fc_daily, on="date", how="inner").sort_values("date")
+    if len(merged) == 0:
+        return daily["y"].to_numpy(dtype=np.float32), None
+    return (
+        merged["y"].to_numpy(dtype=np.float32),
+        merged["forecast_median"].to_numpy(dtype=np.float32),
+    )
+
+
 def make_env(
     uid: str,
     hourly_df: pd.DataFrame,
@@ -381,18 +419,14 @@ def make_env(
     if on_missing_forecast not in {"raise", "naive"}:
         raise ValueError("on_missing_forecast must be 'raise' or 'naive'")
     config = config or InventoryEnvConfig()
-    demand = _get_daily_demand(hourly_df, uid, split)
+    demand, forecasts = _aligned_daily_series(hourly_df, uid, split, forecast_df)
     if len(demand) == 0:
         raise ValueError(f"No data for uid={uid}, split={split}")
-    split_dates = set(hourly_df[(hourly_df["unique_id"] == uid) & (hourly_df["split"] == split)]["ds"].dt.date)
-    forecasts = _get_daily_forecast(forecast_df, uid, split_dates)
     if forecast_df is not None and forecasts is None and on_missing_forecast == "raise":
         raise ValueError(
             f"No forecast data for uid={uid}, split={split}. "
             "Pass on_missing_forecast='naive' to use the causal persistence fallback."
         )
-    if forecasts is not None and len(forecasts) != len(demand):
-        raise ValueError("forecast length mismatch for uid")
     return InventoryEnv(demand_series=demand, forecast_series=forecasts, config=config)
 
 
@@ -412,15 +446,11 @@ def make_category_env(
     uid_list: list[str] = []
 
     for uid in uids:
-        demand = _get_daily_demand(hourly_df, uid, split)
+        demand, forecasts = _aligned_daily_series(hourly_df, uid, split, forecast_df)
         if len(demand) < min_series_days:
             continue
-        split_dates = set(hourly_df[(hourly_df["unique_id"] == uid) & (hourly_df["split"] == split)]["ds"].dt.date)
-        forecasts = _get_daily_forecast(forecast_df, uid, split_dates)
         if forecast_df is not None and forecasts is None:
             raise ValueError(f"No forecast data for uid={uid}, split={split}")
-        if forecasts is not None and len(forecasts) != len(demand):
-            raise ValueError(f"forecast length mismatch for uid={uid}")
         demand_list.append(demand)
         uid_list.append(uid)
         if forecasts is not None:

@@ -76,6 +76,26 @@ def test_observation_never_contains_future_demand():
     assert np.allclose(fc, demand[0]), "after one step the proxy is the last OBSERVED demand"
 
 
+def test_env_aligns_demand_and_forecast_on_common_dates():
+    """A model cannot forecast the first input_size steps of a series, so forecasts
+    legitimately start later than demand. Both are inner-joined on date rather than
+    padded with invented values."""
+    ds = pd.date_range("2024-01-01", periods=24 * 10, freq="h")
+    hourly = pd.DataFrame({
+        "unique_id": "A", "ds": ds, "y": 1.0, "split": "train", "first_category_id": 10,
+    })
+    # forecast is missing the first 3 days, as a real warmup gap would be
+    fc_ds = ds[ds >= pd.Timestamp("2024-01-04")]
+    forecast = pd.DataFrame({"unique_id": "A", "ds": fc_ds, "forecast_median": 1.0})
+
+    env = make_env("A", hourly, split="train", forecast_df=forecast,
+                   config=InventoryEnvConfig(episode_length=5, random_start=False))
+
+    assert len(env.demand) == 7, "10 demand days inner-joined with 7 forecast days"
+    assert env.forecasts is not None and len(env.forecasts) == len(env.demand)
+    assert np.allclose(env.forecasts, 24.0), "daily forecast is the SUM of hourly values"
+
+
 def test_daily_forecast_sums_to_match_daily_demand():
     """_get_daily_demand sums hourly y; _get_daily_forecast must sum too.
 
