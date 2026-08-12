@@ -160,6 +160,45 @@ def test_zero_forecaster_is_the_control_for_sparse_targets(split_hourly_df: pd.D
     assert metrics.bias <= 0.0
 
 
+def test_adapter_ignores_spurious_index_column_from_reset_index():
+    """NeuralForecast >=3.2 returns unique_id as a COLUMN with a RangeIndex.
+
+    Calling .reset_index() on that injects an "index" column holding row numbers.
+    It sorts first, so a positional pick scores the ROW NUMBER as the forecast -
+    values 0..n-1, which overflow expm1 under a log target and produced mae=inf on
+    real data while every local test still passed on the older nf layout.
+    """
+    bundle = ForecastDatasetBundle(
+        full_df=pd.DataFrame(), train_df=pd.DataFrame(), val_df=pd.DataFrame(), test_df=pd.DataFrame(),
+        static_df=pd.DataFrame(), future_cols=[], historic_cols=[], target_col="y_model", raw_target_col="y",
+    )
+
+    class _NF32:
+        """Mimics neuralforecast >= 3.2: unique_id is a column, index is a RangeIndex."""
+
+        def make_future_dataframe(self, df=None):
+            return pd.DataFrame({"unique_id": ["A", "B"], "ds": [pd.Timestamp("2024-01-02")] * 2})
+
+        def predict(self, df=None, static_df=None, futr_df=None):
+            return pd.DataFrame(
+                {"unique_id": ["A", "B"], "ds": [pd.Timestamp("2024-01-02")] * 2, "TFT": [0.25, 0.75]},
+                index=pd.RangeIndex(2),
+            )
+
+    class _Model:
+        h = 1
+
+    adapter = NeuralForecastAdapter(_Model(), "TFT")
+    adapter._nf = _NF32()
+    history = pd.DataFrame({"unique_id": ["A", "B"], "ds": [pd.Timestamp("2024-01-01")] * 2, "y_model": [1.0, 2.0]})
+    future = pd.DataFrame({"unique_id": ["A", "B"], "ds": [pd.Timestamp("2024-01-02")] * 2, "y_model": [1.5, 2.5]})
+
+    out = adapter.predict(history, future, bundle)
+
+    assert "index" not in out.columns
+    assert list(out["prediction"]) == [0.25, 0.75], "must score the TFT column, not row numbers"
+
+
 def test_adapter_prefers_median_column_under_quantile_loss():
     """Under MQLoss the output has median/lo/hi columns in no guaranteed order, so
     taking the first column can score a tail quantile as the point forecast.

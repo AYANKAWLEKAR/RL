@@ -86,6 +86,36 @@ class PersistenceForecaster:
         return preds
 
 
+# Columns that are never a forecast. "index"/"level_0" appear when reset_index() is
+# called on a frame that already carries unique_id as a column, which is exactly what
+# NeuralForecast >= 3.2 returns.
+_NON_PREDICTION_COLUMNS = frozenset({"unique_id", "ds", "index", "level_0", "cutoff"})
+
+
+def _normalize_prediction_frame(preds: pd.DataFrame) -> pd.DataFrame:
+    """Return NeuralForecast output with unique_id/ds as columns and no junk index column.
+
+    NeuralForecast changed this shape across versions: <=3.1 returns unique_id as the
+    DataFrame index, >=3.2 returns it as a regular column with a RangeIndex. Calling
+    .reset_index() unconditionally therefore injects a spurious "index" column on the
+    newer versions. That column sorts first in the remaining-columns list, so a
+    positional pick like model_cols[0] silently scores the ROW NUMBER as the forecast
+    (values 0..n-1, which then overflow expm1 under a log target).
+    """
+    if "unique_id" in preds.columns:
+        return preds.reset_index(drop=True)
+    return preds.reset_index()
+
+
+def _select_prediction_column(columns: list[str]) -> str:
+    """Pick the point-forecast column, preferring an explicit median under quantile loss."""
+    candidates = [c for c in columns if c not in _NON_PREDICTION_COLUMNS]
+    if not candidates:
+        raise RuntimeError(f"No prediction column found in NeuralForecast output: {columns}")
+    median = [c for c in candidates if "median" in c.lower()]
+    return median[0] if median else candidates[0]
+
+
 class ZeroForecaster:
     """Predicts zero everywhere. The control for intermittent demand.
 
@@ -281,7 +311,9 @@ class NeuralForecastAdapter:
             futr_input = expected.merge(future_exog, on=["unique_id", "ds"], how="left")
             futr_input[bundle.future_cols] = futr_input[bundle.future_cols].fillna(0.0)
 
-            preds = self._nf.predict(df=rolling_history, static_df=bundle.static_df, futr_df=futr_input).reset_index()
+            preds = _normalize_prediction_frame(
+                self._nf.predict(df=rolling_history, static_df=bundle.static_df, futr_df=futr_input)
+            )
             forecasts.append(preds)
 
             next_actuals = future_actuals.merge(expected[["unique_id", "ds"]], on=["unique_id", "ds"], how="inner")
@@ -292,14 +324,5 @@ class NeuralForecastAdapter:
         if not forecasts:
             return pd.DataFrame(columns=["unique_id", "ds", "prediction"])
         all_preds = pd.concat(forecasts, ignore_index=True)
-        model_cols = [c for c in all_preds.columns if c not in {"unique_id", "ds"}]
-        if not model_cols:
-            raise RuntimeError("NeuralForecast returned no prediction columns")
-        # Under a point loss (MAE) there is exactly one output column. Under a
-        # quantile loss (MQLoss) there are several — "<Model>-median", "<Model>-lo-90",
-        # "<Model>-hi-90" ... — and column order is NOT guaranteed to put the median
-        # first, so taking model_cols[0] can silently score a tail quantile as if it
-        # were the point forecast. Prefer an explicit median column when present.
-        median_cols = [c for c in model_cols if "median" in c.lower()]
-        pred_col = median_cols[0] if median_cols else model_cols[0]
+        pred_col = _select_prediction_column(list(all_preds.columns))
         return all_preds[["unique_id", "ds", pred_col]].rename(columns={pred_col: "prediction"})
