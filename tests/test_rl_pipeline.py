@@ -10,6 +10,8 @@ from src.rl_pipeline import (
     DQNConfig,
     InventoryEnv,
     InventoryEnvConfig,
+    _get_daily_demand,
+    _get_daily_forecast,
     build_dqn_agent,
     evaluate_policy,
     make_category_env,
@@ -24,21 +26,117 @@ def _forecast_df_from_hourly(split_hourly_df: pd.DataFrame) -> pd.DataFrame:
     return export_rl_forecast_features(preds)
 
 
-def test_inventory_env_step_and_termination():
+def test_inventory_env_reports_time_limit_as_truncation_not_termination():
+    """Running out of horizon is a TRUNCATION, not a terminal state.
+
+    Reporting terminated=True made SB3 stop bootstrapping at the episode boundary
+    (target = r instead of r + gamma*maxQ'), which systematically biases values down.
+    """
     env = InventoryEnv(
         demand_series=np.array([3, 4, 5], dtype=np.float32),
         forecast_series=np.array([3, 4, 5], dtype=np.float32),
-        config=InventoryEnvConfig(lead_time=2, episode_length=3, forecast_horizon=2, stockout_history_len=3),
+        config=InventoryEnvConfig(
+            lead_time=2, episode_length=3, forecast_horizon=2, stockout_history_len=3, random_start=False
+        ),
     )
     obs, _ = env.reset()
     assert obs.shape[0] == env.observation_space.shape[0]
-    obs, reward, terminated, _, info = env.step(2)
+    obs, reward, terminated, truncated, info = env.step(2)
     assert reward < 0
     assert info["step_cost"] > 0
-    assert terminated is False
+    assert (terminated, truncated) == (False, False)
     env.step(0)
-    _, _, terminated, _, _ = env.step(0)
-    assert terminated is True
+    _, _, terminated, truncated, _ = env.step(0)
+    assert terminated is False, "the world does not genuinely end; this is a time limit"
+    assert truncated is True
+
+
+def test_observation_never_contains_future_demand():
+    """With no external forecast the env must NOT hand the agent the realised future.
+
+    Previously _get_obs fell back to self.demand, so the forecast block was literally
+    the next H days of true demand. Any "RL beats baseline" result under that setup
+    was measuring an oracle, not a policy.
+    """
+    demand = np.array([7.0, 99.0, 3.0, 42.0, 11.0, 8.0, 5.0, 2.0], dtype=np.float32)
+    env = InventoryEnv(
+        demand_series=demand,
+        forecast_series=None,
+        config=InventoryEnvConfig(
+            forecast_horizon=4, episode_length=8, lead_time=2, stockout_history_len=2, random_start=False
+        ),
+    )
+    obs, _ = env.reset()
+    fc = obs[1 + 2 : 1 + 2 + 4]
+    assert not np.allclose(fc, demand[:4]), "forecast block leaks true future demand"
+    assert np.allclose(fc, 0.0), "no history at t=0, so the causal proxy is 0"
+
+    obs, _, _, _, _ = env.step(0)
+    fc = obs[1 + 2 : 1 + 2 + 4]
+    assert np.allclose(fc, demand[0]), "after one step the proxy is the last OBSERVED demand"
+
+
+def test_daily_forecast_sums_to_match_daily_demand():
+    """_get_daily_demand sums hourly y; _get_daily_forecast must sum too.
+
+    Using .mean() made a *perfect* hourly forecast read 24x smaller than the demand
+    the agent actually faced.
+    """
+    ds = pd.date_range("2024-01-01", periods=72, freq="h")
+    hourly = pd.DataFrame({"unique_id": "A", "ds": ds, "y": 2.0, "split": "train", "first_category_id": 10})
+    perfect = pd.DataFrame({"unique_id": "A", "ds": ds, "forecast_median": 2.0})
+
+    demand = _get_daily_demand(hourly, "A", "train")
+    forecast = _get_daily_forecast(perfect, "A", set(ds.date))
+
+    assert np.allclose(demand, 48.0)
+    assert np.allclose(forecast, demand), "a perfect hourly forecast must equal daily demand"
+
+
+def test_order_up_to_action_scales_beyond_a_fixed_cap():
+    """Actions are target inventory POSITIONS, so reachable cover scales with demand.
+
+    A fixed 0..50 quantity grid could not cover 26% of real series (up to 28 units/day
+    at lead_time=2 needs ~84 units).
+    """
+    cfg = InventoryEnvConfig(n_order_levels=20, order_level_step=5.0, lead_time=2, random_start=False)
+    env = InventoryEnv(demand_series=np.full(30, 28.0, dtype=np.float32), config=cfg)
+    env.reset()
+
+    assert env.action_space.n == 21
+    assert cfg.max_order == 100.0, "grid must reach beyond the old 50-unit cap"
+    # from empty, the top action orders the full target
+    env.inventory, env.pipeline = 0.0, np.zeros(2, dtype=np.float32)
+    assert env._order_from_action(20) == 100.0
+    # already well stocked -> the same action orders only the shortfall
+    env.inventory = 90.0
+    assert env._order_from_action(20) == 10.0
+    env.inventory = 120.0
+    assert env._order_from_action(20) == 0.0, "never order below the target position"
+
+
+def test_random_start_gives_evaluation_real_variance():
+    """A fixed start makes a single-product env deterministic, so std_cost is always
+    exactly 0.0 and averaging over N episodes measures one episode N times."""
+    rng = np.random.default_rng(0)
+    demand = rng.gamma(4, 3, 400).astype(np.float32)
+
+    fixed = InventoryEnv(demand_series=demand, config=InventoryEnvConfig(episode_length=100, random_start=False))
+    varied = InventoryEnv(demand_series=demand, config=InventoryEnvConfig(episode_length=100, random_start=True))
+    policy = lambda obs, e: sS_policy(obs, e, s=20, S=50)  # noqa: E731
+
+    assert evaluate_policy(fixed, policy, n_episodes=4)["std_cost"] == 0.0
+    assert evaluate_policy(varied, policy, n_episodes=8)["std_cost"] > 0.0
+
+
+def test_reward_is_scaled_but_total_cost_stays_raw():
+    """Q-values must be learnable while reported cost stays interpretable."""
+    cfg = InventoryEnvConfig(episode_length=5, reward_scale=0.01, random_start=False)
+    env = InventoryEnv(demand_series=np.full(10, 10.0, dtype=np.float32), config=cfg)
+    env.reset()
+    _, reward, _, _, info = env.step(4)
+    assert reward == pytest.approx(-info["step_cost"] * cfg.reward_scale)
+    assert env.total_cost == pytest.approx(info["step_cost"]), "total_cost stays in raw units"
 
 
 def test_category_env_samples_products():
