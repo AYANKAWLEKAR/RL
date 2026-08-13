@@ -474,3 +474,57 @@ Still one cost configuration and one seed. The shared policy is not compared per
 against per-product-tuned `(s,S)` — a per-product baseline tuned individually on 400
 series would be a stronger opponent than one shared `(s,S)`, and is the honest next
 comparison. The Part 5 imputation caveat continues to apply.
+
+---
+
+## Part 11 — Re-measured after closing the forecast leak
+
+An independent review of the plan (see `decisions.md` D14/D15) found that the forecast
+block the RL agent reads was a **rolling** 1-day-ahead series, so slots 1-6 of a 7-slot
+block were conditioned on demand the agent had not observed. `(s,S)` reads no forecast,
+so all of that was agent-side advantage. Evaluation was also unseeded, so the baseline
+and the agent were scored on different episodes and no number was reproducible.
+
+Both are fixed. Everything below is re-measured with the leak closed and paired,
+seeded evaluation. **These supersede Parts 7, 9 and 10.**
+
+### Single product, 5 seeds
+
+| | leaky | fixed |
+|---|---|---|
+| (s,S) test cost | 493.1 | 521.5 |
+| DQN mean | 346.3 (sd 37.5) | **368.7** (sd 46.8) |
+| Seeds beating (s,S) | 5/5 | **5/5** |
+| Improvement | +29.8% | **+29.3%** |
+
+Essentially unchanged — because seeding re-measured *both* sides on the same episodes,
+the baseline moved too. The single-product result was not carried by the leak.
+
+### Shared policy, 400 series across 7 categories
+
+| | leaky | fixed |
+|---|---|---|
+| (s,S) in days | 771.9 | 664.1 |
+| DQN (shared) | 480.5 | **491.0** |
+| Service level | 0.916 vs 0.732 | **0.865 vs 0.737** |
+| Improvement | +37.7% | **+26.1%** |
+
+Welch t = -3.07, diff 173.1 ± 110.6 — still significant, but **the leak was worth about
+11.6 percentage points** of the headline. The honest number is 26.1%.
+
+### Two corrections to earlier claims
+
+1. **"Overfitting eliminated (+0.0)" was partly an artifact.** With paired seeded
+   evaluation the shared policy's val degradation is **+26.7**, not +0.0. It is still far
+   below the single-product +86.9, so the Part 8 conclusion (more data is the cure) holds
+   — but the effect was overstated by unseeded evaluation noise.
+2. **The baseline was NOT pinned to its grid ceiling.** The review raised this as a risk;
+   the seeded search selected `(s_d, S_d) = (3.0, 5.0)` days, an interior point of the
+   `[1.5 … 6.0]` grid. The concern does not hold here.
+
+### Why this is the most important entry in this document
+
+Three headline numbers were published, then re-measured downward after finding a leak in
+the code that produced them. The 26.1% is smaller than the 37.7% and it is the one worth
+trusting. A result that survives its own audit is worth more than a larger one that has
+not been audited.
