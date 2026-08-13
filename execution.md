@@ -242,7 +242,9 @@ Evaluate in this order:
    never orders, is a degenerate solution that aggregate cost can hide.
 
 **Honest reporting:** if DQN loses to `(s,S)` after the fixes, that is a
-legitimate result worth writing down. `(s,S)` is provably optimal under
+legitimate result worth writing down. `(s,S)` is a strong industry-standard baseline
+but is NOT provably optimal here (Scarf assumes backorders + stationary demand; this env
+has lost sales + seasonality), so it is a real bar under
 assumptions this environment nearly satisfies, so beating it is a high bar. Tuning
 until DQN wins, then reporting only that run, is how the original `0.05 MAE`
 number happened.

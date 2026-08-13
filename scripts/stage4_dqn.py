@@ -12,7 +12,10 @@ Evaluation protocol, in order:
   4. Service level alongside cost - a policy can "win" on cost by refusing to stock.
   5. A rollout trace, because aggregate cost hides degenerate policies.
 
-If DQN loses to (s,S) that is reported as-is. (s,S) is provably optimal for this
+If DQN loses to (s,S) that is reported as-is. (s,S) is a strong industry-standard
+baseline, though NOT provably optimal here - Scarf's result assumes backorders and
+stationary demand, while this env has lost sales and seasonality, where (s,S) is known
+not to be optimal. It is still a real bar for this
 problem class under fairly general conditions, so it is a real bar.
 """
 import argparse

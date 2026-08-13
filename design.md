@@ -255,7 +255,10 @@ gets worse and more honest.
 
 ### On the eventual DQN result
 
-`(s,S)` is provably optimal for this problem class under fairly general conditions, so
+`(s,S)` is a strong industry-standard baseline but is **not** provably optimal here —
+Scarf's result assumes backorders and stationary demand, while this env has **lost
+sales** and seasonality, where `(s,S)` is known not to be optimal. Beating it is a real
+bar, but a lower one than "provably optimal" implies, so
 beating it is a **high bar, not a formality**. If DQN loses after a correct comparison,
 that is a legitimate result worth writing down. Tuning until it wins and reporting only
 that run is the same failure mode that produced the original `0.05 MAE`.

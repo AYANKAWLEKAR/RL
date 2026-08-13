@@ -31,6 +31,17 @@ class InventoryEnvConfig:
     variable_order_cost: float = 1.0
     episode_length: int = 365
     forecast_horizon: int = 7
+
+    # How many leading entries of a supplied forecast series are genuinely knowable at
+    # decision time. Our TFT forecasts come from a walk-forward that re-bases on true
+    # actuals every `ForecastConfig.horizon` hours (= 1 day), so only the NEXT day is
+    # causal: forecasts[now+k] for k>=1 was conditioned on demand the agent has not
+    # observed yet. Reading the full 7-slot block leaked up to 6 days of future demand
+    # into the observation, and since (s,S) reads no forecast at all, 100% of that was
+    # agent-side advantage. Raise this only for a genuinely multi-step-ahead forecast
+    # from a single origin (e.g. a TFT trained with h=168 for 7-day-ahead).
+    forecast_causal_steps: int = 1
+
     stockout_history_len: int = 14
 
     # Action a in {0..n_order_levels} maps to a target inventory position of
@@ -167,13 +178,22 @@ class InventoryEnv(gym.Env):
         """
         horizon = self.config.forecast_horizon
         now = self._start + self.t
-        if self.forecasts is not None:
-            fc = np.zeros(horizon, dtype=np.float32)
-            end = min(now + horizon, len(self.forecasts))
-            if end > now:
-                fc[: end - now] = self.forecasts[now:end]
-            return fc
         last_observed = float(self.demand[now - 1]) if now > 0 else 0.0
+        if self.forecasts is not None:
+            # Only the causal PREFIX of the supplied series is knowable now. The series
+            # is a rolling forecast re-based on true actuals every causal_steps days, so
+            # forecasts[now+k] for k >= causal_steps saw demand the agent has not. Fill
+            # the remaining slots by persisting the last causal value rather than
+            # reading ahead.
+            fc = np.zeros(horizon, dtype=np.float32)
+            causal = max(1, int(self.config.forecast_causal_steps))
+            end = min(now + causal, len(self.forecasts), now + horizon)
+            filled = max(0, end - now)
+            if filled:
+                fc[:filled] = self.forecasts[now:end]
+            if filled < horizon:
+                fc[filled:] = fc[filled - 1] if filled else last_observed
+            return fc
         return np.full(horizon, last_observed, dtype=np.float32)
 
     def _get_obs(self):
@@ -583,11 +603,24 @@ def make_multi_product_env(
     )
 
 
-def evaluate_policy(env, policy_fn, n_episodes: int = 5) -> dict[str, float]:
+def evaluate_policy(env, policy_fn, n_episodes: int = 5, seed: int | None = 0) -> dict[str, float]:
+    """Evaluate a policy over n_episodes.
+
+    `seed` makes the episode draw reproducible and, more importantly, PAIRED: any two
+    policies scored with the same seed face the identical sequence of start windows
+    (and, in the multi-product env, the identical products). reset() used to be called
+    with no seed, which meant:
+      * the baseline and the agent were scored on DIFFERENT random episodes, so the
+        comparison was unpaired and carried needless variance;
+      * an (s,S) grid search argmin'd over evaluation noise, picking the luckiest draw
+        rather than the best policy - a handicap the DQN never faced;
+      * no reported number could be reproduced by re-running.
+    Pass seed=None for a genuinely fresh draw.
+    """
     total_costs = []
     service_levels = []
-    for _ in range(n_episodes):
-        obs, _ = env.reset()
+    for episode in range(n_episodes):
+        obs, _ = env.reset(seed=None if seed is None else seed + episode)
         done = False
         while not done:
             action = policy_fn(obs, env)

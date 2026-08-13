@@ -78,6 +78,66 @@ def test_observation_never_contains_future_demand():
     assert np.allclose(fc, demand[0]), "after one step the proxy is the last OBSERVED demand"
 
 
+def test_supplied_forecast_block_is_causal_not_a_rolling_lookahead():
+    """The path ALL headline RL results ran under had no causality test.
+
+    The forecast series handed to the env is a ROLLING 1-day-ahead forecast: entry d
+    was produced from an origin at day d-1, re-based on true actuals. Reading the whole
+    7-slot block therefore surfaced entries conditioned on demand the agent had not
+    observed - up to 6 days of lookahead, growing with slot index. (s,S) reads no
+    forecast, so every bit of that was agent-side advantage.
+
+    Only the causal prefix may come from the series; the rest persists the last causal
+    value.
+    """
+    # a forecast series that is trivially identifiable per index
+    demand = np.arange(1, 21, dtype=np.float32)
+    forecasts = np.arange(101, 121, dtype=np.float32)  # forecasts[i] == 101 + i
+    cfg = InventoryEnvConfig(
+        forecast_horizon=7, forecast_causal_steps=1, lead_time=2,
+        stockout_history_len=2, episode_length=15, random_start=False,
+    )
+    env = InventoryEnv(demand_series=demand, forecast_series=forecasts, config=cfg)
+    obs, _ = env.reset()
+    fc = obs[1 + 2 : 1 + 2 + 7]
+
+    assert fc[0] == pytest.approx(101.0), "slot 0 is the genuinely causal next-day forecast"
+    # the leak would have produced 102..107 here
+    assert not np.allclose(fc[1:], forecasts[1:7]), "block must not expose the rolling lookahead"
+    assert np.allclose(fc[1:], 101.0), "non-causal slots persist the last causal value"
+
+    # advancing a step advances the causal entry by exactly one
+    obs, _, _, _, _ = env.step(0)
+    fc = obs[1 + 2 : 1 + 2 + 7]
+    assert fc[0] == pytest.approx(102.0)
+    assert np.allclose(fc[1:], 102.0)
+
+
+def test_evaluate_policy_is_seeded_and_paired():
+    """Two policies scored with the same seed must face identical episodes.
+
+    Unseeded reset() meant the baseline and the agent were compared on different random
+    windows, and an (s,S) grid search argmin'd over evaluation noise.
+    """
+    rng = np.random.default_rng(0)
+    demand = rng.gamma(4, 3, 300).astype(np.float32)
+    cfg = InventoryEnvConfig(episode_length=20, random_start=True)
+
+    def costs(seed):
+        env = InventoryEnv(demand_series=demand, config=cfg)
+        return evaluate_policy(env, lambda o, e: 0, n_episodes=6, seed=seed)["avg_cost"]
+
+    assert costs(0) == pytest.approx(costs(0)), "same seed must reproduce exactly"
+    assert costs(0) != pytest.approx(costs(99)), "different seeds must draw different windows"
+
+    # paired: the never-order and (s,S) policies see the SAME demand windows
+    e1 = InventoryEnv(demand_series=demand, config=cfg)
+    e2 = InventoryEnv(demand_series=demand, config=cfg)
+    evaluate_policy(e1, lambda o, e: 0, n_episodes=4, seed=7)
+    evaluate_policy(e2, lambda o, e: sS_policy(o, e, s=20, S=50), n_episodes=4, seed=7)
+    assert e1.history["demand"] == e2.history["demand"], "same seed => same realised demand"
+
+
 def test_env_aligns_demand_and_forecast_on_common_dates():
     """A model cannot forecast the first input_size steps of a series, so forecasts
     legitimately start later than demand. Both are inner-joined on date rather than
