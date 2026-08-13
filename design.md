@@ -408,3 +408,66 @@ One product, one demand band (7.93 units/day), one cost configuration. This says
 can beat a tuned `(s,S)` on *this* problem instance, robustly across seeds. It does not
 establish that it generalizes across products, demand scales, or cost structures — that
 is what the untrained category agent would test.
+
+---
+
+## Part 10 — Shared policy across categories
+
+Part 8 concluded the single-product agent overfits for lack of data, and that the cure
+is more data rather than any hyperparameter. This tests that directly: one DQN over
+**400 series spanning all 7 categories**, demand 5.4-28.2 units/day.
+
+### Two defects had to be fixed before this was even possible
+
+Running the multi-product env as it stood would have produced a misleading failure:
+
+1. **Product identity was an arbitrary ordinal.** `product_norm = _current_idx /
+   n_products` is a position in a list — it cannot distinguish a 5 unit/day series from
+   a 28 unit/day one.
+2. **Actions were absolute units.** Action 4 (=20 units) is 4 days of cover for a 5/day
+   series and 0.7 days for a 28/day one. The same action meant different things per
+   product, so no single policy could be right for all of them.
+
+`scale_normalize` puts **state and actions in days of cover** using a per-series demand
+scale from `compute_train_scales` (TRAIN split only, so evaluation never normalizes with
+held-out demand). `sS_policy_scaled` gives the baseline the same treatment — a fixed
+unit-threshold `(s,S)` competing against a scale-aware agent would be rigged.
+
+### Results
+
+Test split, 200 episodes over 400 products:
+
+| Policy | Cost | ± sd | Service |
+|---|---|---|---|
+| **DQN (shared)** | **480.5** | 454.4 | **0.916** |
+| (s,S) in days | 771.9 | 708.1 | 0.732 |
+| NeverOrder | 2546.6 | 1912.6 | 0.169 |
+
+**DQN wins by 37.7%**, at a much higher service level (0.916 vs 0.732). Welch t = −4.90
+(df ≈ 339), 95% CIs disjoint ([418, 543] vs [674, 870]).
+
+The large sd is **cross-product heterogeneity**, not policy instability: each episode
+samples a different product, and products differ 5x in scale. It is not comparable to
+the single-product sd.
+
+### The overfitting question — answered
+
+| | val degradation, best → final |
+|---|---|
+| single product (61 days, ~51 windows) | **+86.9** |
+| 400 products, all categories | **+0.0** |
+
+The shared agent's best checkpoint **is** its final one at 150k steps, and the curve was
+still improving when the budget ran out (471 → 452 → 429 → 420 → 385 → 378 → 336). The
+overfitting diagnosed in Part 8 is **gone**, and the Part 8 diagnosis — a data-quantity
+limit with no hyperparameter fix — is confirmed by removing the limit.
+
+This also inverts the earlier budget finding: at one product, 60k steps was past the
+overfitting point and 30k did better. At 400 products, 150k steps was **not enough**.
+
+### Scope
+
+Still one cost configuration and one seed. The shared policy is not compared per-product
+against per-product-tuned `(s,S)` — a per-product baseline tuned individually on 400
+series would be a stronger opponent than one shared `(s,S)`, and is the honest next
+comparison. The Part 5 imputation caveat continues to apply.
