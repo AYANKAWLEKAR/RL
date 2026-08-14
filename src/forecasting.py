@@ -86,6 +86,57 @@ class PersistenceForecaster:
         return preds
 
 
+# Columns that are never a forecast. "index"/"level_0" appear when reset_index() is
+# called on a frame that already carries unique_id as a column, which is exactly what
+# NeuralForecast >= 3.2 returns.
+_NON_PREDICTION_COLUMNS = frozenset({"unique_id", "ds", "index", "level_0", "cutoff"})
+
+
+def _normalize_prediction_frame(preds: pd.DataFrame) -> pd.DataFrame:
+    """Return NeuralForecast output with unique_id/ds as columns and no junk index column.
+
+    NeuralForecast changed this shape across versions: <=3.1 returns unique_id as the
+    DataFrame index, >=3.2 returns it as a regular column with a RangeIndex. Calling
+    .reset_index() unconditionally therefore injects a spurious "index" column on the
+    newer versions. That column sorts first in the remaining-columns list, so a
+    positional pick like model_cols[0] silently scores the ROW NUMBER as the forecast
+    (values 0..n-1, which then overflow expm1 under a log target).
+    """
+    if "unique_id" in preds.columns:
+        return preds.reset_index(drop=True)
+    return preds.reset_index()
+
+
+def _select_prediction_column(columns: list[str]) -> str:
+    """Pick the point-forecast column, preferring an explicit median under quantile loss."""
+    candidates = [c for c in columns if c not in _NON_PREDICTION_COLUMNS]
+    if not candidates:
+        raise RuntimeError(f"No prediction column found in NeuralForecast output: {columns}")
+    median = [c for c in candidates if "median" in c.lower()]
+    return median[0] if median else candidates[0]
+
+
+class ZeroForecaster:
+    """Predicts zero everywhere. The control for intermittent demand.
+
+    On sparse series (FreshRetailNet is ~78% zero hours, mean 0.042 units/hour)
+    MAE is minimized by the conditional median, which is zero. A model can post an
+    impressive-looking MAE while having learned nothing. Always report this
+    alongside real models: if a model cannot beat predicting zero, its MAE is
+    measuring the sparsity of the data, not the skill of the model.
+    """
+
+    name = "Zero"
+
+    def fit(self, train_df: pd.DataFrame, val_df: pd.DataFrame, bundle: ForecastDatasetBundle) -> None:
+        return None
+
+    def predict(self, history_df: pd.DataFrame, future_df: pd.DataFrame, bundle: ForecastDatasetBundle) -> pd.DataFrame:
+        preds = future_df[["unique_id", "ds"]].copy()
+        preds["prediction"] = 0.0
+        return preds
+
+
 def prepare_forecast_frames(
     hourly_df: pd.DataFrame,
     config: ForecastConfig | None = None,
@@ -212,7 +263,46 @@ class NeuralForecastAdapter:
         # bundle.target_col is "y_model" whenever a log1p transform is applied, so it
         # must be renamed here or fit() raises KeyError('y').
         nf_train = train_df[cols].rename(columns={bundle.target_col: "y"})
-        self._nf.fit(df=nf_train, static_df=bundle.static_df, val_size=len(val_df))
+        self._nf.fit(df=nf_train, static_df=bundle.static_df, val_size=self._val_size(train_df, val_df))
+
+    def _val_size(self, train_df: pd.DataFrame, val_df: pd.DataFrame) -> int:
+        """Early-stopping holdout, in PER-SERIES timesteps.
+
+        NeuralForecast's `val_size` is a number of timesteps carved off the end of
+        each series, NOT a row count. Passing len(val_df) works by accident with one
+        or two series and explodes on a real panel: with 502 series each having
+        ~1,629 train steps, len(val_df)=175,198 gives 1,629 - 175,198 = -173,569 and
+        fit() raises. Convert to per-series, then clamp so every series retains at
+        least input_size + h steps to actually train on.
+        """
+        n_series = max(int(train_df["unique_id"].nunique()), 1)
+        per_series_val = int(len(val_df) // n_series)
+        per_series_train = int(len(train_df) // n_series)
+        input_size = int(getattr(self.model, "input_size", 0) or 0)
+        horizon = int(getattr(self.model, "h", 0) or 0)
+        headroom = per_series_train - input_size - horizon
+        return int(max(0, min(per_series_val, max(0, headroom))))
+
+    def _trim_history(self, history: pd.DataFrame) -> pd.DataFrame:
+        """Keep only the most recent steps each series needs to condition on.
+
+        The model conditions on `input_size` steps, so carrying the full accumulated
+        history forward makes each window re-process everything seen so far - O(n^2)
+        across the walk. On 502 series x 68 windows that dominated runtime (~14 min
+        for a single split). Trimming is result-neutral: anything older than
+        input_size cannot enter the encoder window anyway.
+        """
+        input_size = int(getattr(self.model, "input_size", 0) or 0)
+        horizon = int(getattr(self.model, "h", 0) or 0)
+        keep = input_size + horizon
+        if keep <= 0:
+            return history
+        return (
+            history.sort_values(["unique_id", "ds"])
+            .groupby("unique_id", sort=False, group_keys=False)
+            .tail(keep)
+            .reset_index(drop=True)
+        )
 
     def predict(self, history_df: pd.DataFrame, future_df: pd.DataFrame, bundle: ForecastDatasetBundle) -> pd.DataFrame:
         if self._nf is None:
@@ -228,7 +318,7 @@ class NeuralForecastAdapter:
         # global date union, because per-series history can end at slightly
         # different timestamps (e.g. differing NaN-drop counts from lag features).
         cols = ["unique_id", "ds", bundle.target_col] + bundle.future_cols + bundle.historic_cols
-        rolling_history = history_df[cols].rename(columns={bundle.target_col: "y"})
+        rolling_history = self._trim_history(history_df[cols].rename(columns={bundle.target_col: "y"}))
         future_exog = future_df[["unique_id", "ds"] + bundle.future_cols]
         future_actuals = future_df[cols].rename(columns={bundle.target_col: "y"})
         max_ds = future_df["ds"].max()
@@ -242,17 +332,19 @@ class NeuralForecastAdapter:
             futr_input = expected.merge(future_exog, on=["unique_id", "ds"], how="left")
             futr_input[bundle.future_cols] = futr_input[bundle.future_cols].fillna(0.0)
 
-            preds = self._nf.predict(df=rolling_history, static_df=bundle.static_df, futr_df=futr_input).reset_index()
+            preds = _normalize_prediction_frame(
+                self._nf.predict(df=rolling_history, static_df=bundle.static_df, futr_df=futr_input)
+            )
             forecasts.append(preds)
 
             next_actuals = future_actuals.merge(expected[["unique_id", "ds"]], on=["unique_id", "ds"], how="inner")
             if next_actuals.empty:
                 break
             rolling_history = pd.concat([rolling_history, next_actuals], ignore_index=True)
+            rolling_history = self._trim_history(rolling_history)
 
         if not forecasts:
             return pd.DataFrame(columns=["unique_id", "ds", "prediction"])
         all_preds = pd.concat(forecasts, ignore_index=True)
-        model_cols = [c for c in all_preds.columns if c not in {"unique_id", "ds"}]
-        pred_col = model_cols[0]
+        pred_col = _select_prediction_column(list(all_preds.columns))
         return all_preds[["unique_id", "ds", pred_col]].rename(columns={pred_col: "prediction"})
