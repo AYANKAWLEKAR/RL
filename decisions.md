@@ -35,6 +35,7 @@ correct calls is a marketing document.
 | [D14](#d14) | Bound the forecast to its causal prefix | 6 of 7 forecast slots leaked the future |
 | [D15](#d15) | Seed and pair evaluation | Numbers weren't reproducible; baseline handicapped |
 | [D16](#d16) | Best-on-val checkpointing | Training overfits a 61-day split |
+| [D17](#d17) | Forecast ablation | Central claim was asserted, never tested |
 
 ---
 
@@ -417,14 +418,86 @@ answer. They're listed as rules because they generalize:
 - **The imputation caveat (D3).** 32.6% of the target is GBM output. Scoring forecast
   accuracy on *observed-only* hours would quantify how much this flatters the metric; it is
   a one-line mask and is the highest-credibility-per-hour item outstanding.
-- **No forecast ablation.** The DQN sees a TFT forecast; `(s,S)` and EOQ do not. So the
-  comparison conflates *learning algorithm* with *information set*, and the project's
-  central claim — that forecasting improves restocking — is **not yet isolated**. The
-  missing experiments are (a) DQN with vs without the forecast block, and (b) a
-  forecast-driven base-stock policy as a baseline.
+- ~~**No forecast ablation.**~~ **Done — see [D17](#d17).** The answer is that the TFT
+  forecast provides **no measurable benefit** over a naive forecast or over zeros
+  (n=20/arm, both comparisons insignificant). A forecast-driven base-stock baseline is
+  still missing and remains the natural next comparison.
 - **Effective sample size (D15).** 15-day test split, 6 distinct overlapping windows.
   Reported confidence intervals are too tight.
 - **Single-origin multi-step forecasts (D14).** Restoring a genuine 7-day lookahead needs a
   TFT trained with `h=168`.
 - **`expand_to_hourly` scaling ceiling (D2).** `.iterrows()` caps the pipeline well below
   the full 50k-series dataset.
+
+---
+
+<a name="d17"></a>
+## D17 — Forecast ablation: the transformer does not measurably help
+
+**The gap this closes.** Every earlier result compared a DQN that reads a TFT forecast
+against `(s,S)` and EOQ, which read no forecast at all. So "DQN beats `(s,S)` by 26%"
+conflated a better **algorithm** with more **information**. The project's central claim —
+that transformer forecasting improves restocking — had been asserted, never tested.
+
+**Design.** Three arms differing *only* in what fills the 7 forecast slots, dispatched at
+the single point the forecast enters the observation (`forecast_mode`):
+
+| Arm | Slots contain | Question |
+|---|---|---|
+| `supplied` | causal TFT forecast | the real system |
+| `zeros` | `0.0` × 7 | does the feature carry **any** information? |
+| `persistence` | last observed demand | does a **learned** forecast beat a **naive** one? |
+
+**Validity check.** `(s,S)` and never-order never read the forecast, so their test costs
+must be identical across arms. They were, bit-for-bit, on both scopes — so any difference
+is the agent, not the harness.
+
+![Forecast ablation](images/forecast_ablation.png)
+
+### Result (single product, 20 seeds per arm, paired episodes)
+
+| Arm | Test cost | ± sd | Service |
+|---|---|---|---|
+| **supplied (TFT)** | **416.9** | 65.2 | 0.763 |
+| persistence | 427.2 | 82.6 | 0.740 |
+| zeros | 434.4 | 65.9 | 0.752 |
+
+| Comparison | diff | 95% CI | Welch t | Verdict |
+|---|---|---|---|---|
+| TFT vs zeros | +17.5 | ± 40.6 | −0.84 | not significant |
+| TFT vs persistence | +10.2 | ± 46.1 | −0.44 | not significant |
+
+**The TFT forecast produces no measurable benefit.** Not against a naive forecast, and
+not even against blanked slots. The ordering is directionally right, but seed spread
+(65–83) dwarfs the gaps between arms (10–17).
+
+### The part worth reading: I reported a false positive first
+
+At **n=5** the same experiment gave TFT vs zeros `t = −2.65` — significant — and I wrote
+that the forecast "did show an effect, against my stated expectation."
+
+That was wrong. At **n=20 it collapsed to −0.84.** The n=5 run happened to draw TFT's
+seeds low (302–417) while persistence carried two bad ones (500.7, 595.2); 15 more seeds
+regressed both to the mean.
+
+This is the same small-sample failure this project had already flagged three times
+(effective n≈6, unseeded evaluation, `episode_length > split`) — and I walked into it
+anyway by running a t-test on five points and believing it. **Recorded because the
+correction is the useful part, not the original claim.**
+
+### Scope of the negative result
+
+The agent sees **one causal day** of forecast: the D14 leak fix collapsed slots 1-6 to a
+persisted value, so this compares a 1-day TFT forecast against 1-day persistence — close
+to the hardest case for a transformer to distinguish itself, especially at `lead_time=2`.
+
+The honest statement is therefore: *a 1-day-ahead TFT forecast provides no measurable
+benefit over naive persistence in this environment* — **not** "forecasting doesn't help
+inventory RL." Separating those needs a TFT trained at `h=168` for a genuine single-origin
+7-day forecast, which is GPU-bound and has not been run.
+
+### What this means for the architecture
+
+As configured, the second stage is not earning its complexity. You could feed the agent a
+naive persistence forecast — or zeros — and lose nothing measurable. That is a real,
+reportable finding, and more useful than the 26.1% headline it qualifies.
