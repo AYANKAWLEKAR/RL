@@ -55,6 +55,13 @@ from src.rl_pipeline import (  # noqa: E402
 ARMS = ["supplied", "zeros", "persistence"]
 
 
+def _seeds(args):
+    """Explicit seed list enables sharding one arm across parallel workers."""
+    if args.seed_list:
+        return [int(x) for x in args.seed_list.split(",") if x.strip()]
+    return list(range(args.seeds))
+
+
 def log(m):
     print("[{}] {}".format(time.strftime("%H:%M:%S"), m), flush=True)
 
@@ -127,7 +134,7 @@ def single_product(hourly, forecast, args):
         never = evaluate_policy(te, lambda o, e: 0, n_episodes=args.eval_episodes)
         checks.append(dict(arm=arm, sS=sS["avg_cost"], never=never["avg_cost"], params=str(best_p)))
 
-        for seed in range(args.seeds):
+        for seed in _seeds(args):
             t0 = time.time()
             m, valbest = train_one(tr, va, te, seed, args.timesteps, args.eval_every,
                                    args.eval_episodes, "sp_" + arm)
@@ -202,6 +209,8 @@ def report_validity(checks, label):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=5)
+    ap.add_argument("--seed-list", default="", help="explicit comma-separated seeds; enables sharding")
+    ap.add_argument("--out", default="artifacts/ablation_results.csv")
     ap.add_argument("--timesteps", type=int, default=30000)
     ap.add_argument("--cat-timesteps", type=int, default=150000)
     ap.add_argument("--eval-every", type=int, default=2500)
@@ -233,7 +242,7 @@ def main():
         all_rows.append(rows)
 
     df = pd.concat(all_rows, ignore_index=True)
-    df.to_csv("artifacts/ablation_results.csv", index=False)
+    df.to_csv(args.out, index=False)
 
     log("=" * 70)
     log("ABLATION SUMMARY (test cost, lower is better)")
@@ -265,7 +274,7 @@ def main():
 
     if not valid:
         log("!! VALIDITY CHECK FAILED - arm comparison is not trustworthy")
-    log("saved artifacts/ablation_results.csv")
+    log("saved {}".format(args.out))
     log("ABLATION DONE in {:.0f}s".format(time.time() - t0))
 
 

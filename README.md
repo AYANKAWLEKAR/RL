@@ -5,8 +5,9 @@ Demand forecasting (Temporal Fusion Transformer) feeding a DQN restocking agent,
 
 The interesting part of this project is not the architecture. It is that the original
 headline metric turned out to be measuring nothing, and rebuilding the evaluation
-surfaced **16 defects** — including two leaks that were inflating the results. Every
-number below is what survived that.
+surfaced defects at every stage — **17 decisions documented in
+[`decisions.md`](decisions.md)**, including two data leaks that were inflating the
+results. Every number below is what survived that.
 
 ---
 
