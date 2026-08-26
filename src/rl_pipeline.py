@@ -42,6 +42,16 @@ class InventoryEnvConfig:
     # from a single origin (e.g. a TFT trained with h=168 for 7-day-ahead).
     forecast_causal_steps: int = 1
 
+    # Ablation arm. The DQN reads a forecast that (s,S) and EOQ never see, so
+    # "DQN beats (s,S)" conflates a better ALGORITHM with more INFORMATION. This flag
+    # isolates the forecast's contribution:
+    #   "supplied"    - TFT forecast (the real system)
+    #   "zeros"       - blank slots: does the feature carry any information at all?
+    #   "persistence" - last observed demand: does a LEARNED forecast beat a naive one?
+    # Only "supplied" reads self.forecasts, so the other two arms are unaffected by
+    # forecast quality and give a clean control.
+    forecast_mode: str = "supplied"
+
     stockout_history_len: int = 14
 
     # Action a in {0..n_order_levels} maps to a target inventory position of
@@ -179,6 +189,20 @@ class InventoryEnv(gym.Env):
         horizon = self.config.forecast_horizon
         now = self._start + self.t
         last_observed = float(self.demand[now - 1]) if now > 0 else 0.0
+
+        # ABLATION SWITCH. This is the single place the forecast enters the observation,
+        # so the experiment arms differ by one enum rather than by a parallel env:
+        #   "supplied"    - the causal prefix of the TFT series  (the real system)
+        #   "zeros"       - blank the slots                      (does the feature carry
+        #                                                         ANY information?)
+        #   "persistence" - last observed demand                 (does a LEARNED forecast
+        #                                                         beat a naive one?)
+        mode = getattr(self.config, "forecast_mode", "supplied")
+        if mode == "zeros":
+            return np.zeros(horizon, dtype=np.float32)
+        if mode == "persistence":
+            return np.full(horizon, last_observed, dtype=np.float32)
+
         if self.forecasts is not None:
             # Only the causal PREFIX of the supplied series is knowable now. The series
             # is a rolling forecast re-based on true actuals every causal_steps days, so

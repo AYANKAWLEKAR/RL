@@ -113,6 +113,55 @@ def test_supplied_forecast_block_is_causal_not_a_rolling_lookahead():
     assert np.allclose(fc[1:], 102.0)
 
 
+def test_forecast_mode_gives_three_clean_ablation_arms():
+    """The three arms must differ ONLY in what fills the forecast slots.
+
+    The DQN reads a forecast that (s,S) never sees, so "DQN beats (s,S)" conflates a
+    better algorithm with more information. These arms isolate the forecast:
+      supplied    -> TFT series (real system)
+      zeros       -> does the feature carry any information at all?
+      persistence -> does a LEARNED forecast beat a naive one?
+    """
+    demand = np.arange(1, 21, dtype=np.float32)
+    forecasts = np.arange(101, 121, dtype=np.float32)
+    base = dict(forecast_horizon=7, forecast_causal_steps=1, lead_time=2,
+                stockout_history_len=2, episode_length=15, random_start=False)
+
+    def block(mode, step_once):
+        env = InventoryEnv(demand_series=demand, forecast_series=forecasts,
+                           config=InventoryEnvConfig(forecast_mode=mode, **base))
+        obs, _ = env.reset()
+        if step_once:
+            obs, _, _, _, _ = env.step(0)
+        return obs[1 + 2 : 1 + 2 + 7], obs.shape[0]
+
+    supplied, dim_s = block("supplied", True)
+    zeros, dim_z = block("zeros", True)
+    persist, dim_p = block("persistence", True)
+
+    # observation SHAPE is identical across arms - only the contents change
+    expected_dim = 1 + base["lead_time"] + base["forecast_horizon"] + base["stockout_history_len"]
+    assert dim_s == dim_z == dim_p == expected_dim
+
+    assert supplied[0] == pytest.approx(102.0), "supplied uses the causal TFT entry"
+    assert np.allclose(zeros, 0.0), "zeros arm blanks the block"
+    assert np.allclose(persist, demand[0]), "persistence arm is the last OBSERVED demand"
+    # the arms are genuinely different signals
+    assert not np.allclose(supplied, zeros)
+    assert not np.allclose(supplied, persist)
+
+    # zeros/persistence must IGNORE the supplied series entirely, so forecast quality
+    # cannot leak into the control arms
+    other = np.arange(901, 921, dtype=np.float32)
+    for mode in ("zeros", "persistence"):
+        e1 = InventoryEnv(demand_series=demand, forecast_series=forecasts,
+                          config=InventoryEnvConfig(forecast_mode=mode, **base))
+        e2 = InventoryEnv(demand_series=demand, forecast_series=other,
+                          config=InventoryEnvConfig(forecast_mode=mode, **base))
+        o1, _ = e1.reset(); o2, _ = e2.reset()
+        assert np.allclose(o1, o2), f"{mode} arm must not depend on the forecast series"
+
+
 def test_evaluate_policy_is_seeded_and_paired():
     """Two policies scored with the same seed must face identical episodes.
 
